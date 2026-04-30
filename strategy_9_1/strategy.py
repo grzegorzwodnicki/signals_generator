@@ -636,51 +636,136 @@ def manual_pick_score(s):
     return min(max(mps, 0), 100)
 
 def classify(s):
-    ts  = s["ts"]
-    mps = s["mps"]
-    if ts < 0 or mps < 0 or s["macd_5m"] == "against" or s["entry_ext"] > 0.50:
-        return "rejected"
-    if s["choch_age"] > 6 or s["rr"] < 2.0:
-        return "rejected"
+    ts        = s["ts"]
+    mps       = s["mps"]
+    pattern   = s["pattern_type"]
+    macd      = s["macd_5m"]
+    choch_age = s["choch_age"]
+    entry_ext = s["entry_ext"]
+    status    = s["status"]
+    fvg       = s.get("fvg")
+    rr        = s["rr"]
 
-    st  = s["status"]
-    ee  = s["entry_ext"]
-    age = s["choch_age"]
-    m   = s["macd_5m"]
+    is_engulfing = "Engulfing" in pattern
+    is_pin_bar   = "Pin Bar"   in pattern
 
-    if age > 4:
+    valid_entry_status = status in {
+        "at_fvg", "at_order_block", "at_fvg_and_order_block",
+    }
+    fvg_filled = bool(fvg and fvg.get("filled", False))
+
+    # Hard rejects
+    if macd == "against":   return "rejected"
+    if entry_ext > 0.50:    return "rejected"
+    if rr < 2.0:            return "rejected"
+    if fvg_filled:          return "rejected"
+    if choch_age > 4:       return "rejected"
+
+    # Below active score threshold
+    if ts < 73:
         return "watchlist"
 
-    if "Pin" in s["pattern_type"]:
-        if ts >= 75 and age <= 2 and m == "yes" and ee <= 0.35:
-            return "secondary_quality"
-        return "watchlist"
-
-    if ts < 65:
-        return "watchlist"
-
-    if st == "confluence_zone":
-        if not ((m == "yes" or ee <= 0.25) and age <= 3):
+    # Pin bar: only exceptional cases can be ACTIVE
+    if is_pin_bar:
+        exceptional = (
+            ts >= 85
+            and choch_age <= 1
+            and macd == "yes"
+            and entry_ext <= 0.25
+            and status == "at_fvg_and_order_block"
+            and rr >= 2.0
+        )
+        if not exceptional:
             return "watchlist"
 
-    if (m == "yes" and ee <= 0.25 and
-            st in ("at_fvg","at_order_block","at_fvg_and_order_block") and
-            age <= 3 and "Engulfing" in s["pattern_type"] and
-            (s["touches_fvg"] or s["touches_ob"])):
+    # Engulfing required for all non-pin-bar active setups
+    if not is_engulfing and not is_pin_bar:
+        return "watchlist"
+
+    # Status rule — confluence_zone only allowed in exceptional case
+    if not valid_entry_status:
+        exceptional_confluence = (
+            status == "confluence_zone"
+            and macd == "yes"
+            and choch_age <= 2
+            and entry_ext <= 0.25
+            and rr >= 2.0
+        )
+        if not exceptional_confluence:
+            return "watchlist"
+
+    # Entry extension 0.25–0.50 needs ≥ 3 premium confirmations
+    if entry_ext > 0.25:
+        pc = 0
+        if macd == "yes":                                        pc += 1
+        if status in {"at_fvg","at_order_block",
+                      "at_fvg_and_order_block"}:                pc += 1
+        if choch_age <= 2:                                       pc += 1
+        if ts >= 85:                                             pc += 1
+        if status == "at_fvg_and_order_block":                  pc += 1
+        if rr >= 3.0:                                            pc += 1
+        if pc < 3:
+            return "watchlist"
+
+    # Premium
+    if (
+        macd == "yes"
+        and entry_ext <= 0.25
+        and valid_entry_status
+        and choch_age <= 3
+        and is_engulfing
+        and rr >= 2.0
+        and mps >= 75
+    ):
         return "premium_setup"
 
-    if (ee <= 0.35 and "Engulfing" in s["pattern_type"] and m in ("yes","none") and
-            st in ("at_fvg","at_order_block","at_fvg_and_order_block") and age <= 4):
+    # High quality
+    if (
+        entry_ext <= 0.25
+        and is_engulfing
+        and macd in {"yes", "none"}
+        and valid_entry_status
+        and choch_age <= 3
+        and rr >= 2.0
+    ):
         return "high_quality"
 
     return "secondary_quality"
 
+
 def recommend_model(s):
-    cat = s.get("category", "")
-    if cat == "premium_setup":
+    category  = s.get("category", "")
+    mps       = s.get("mps", 0)
+    macd      = s.get("macd_5m", "none")
+    entry_ext = s.get("entry_ext", 1.0)
+    choch_age = s.get("choch_age", 999)
+    status    = s.get("status", "")
+    regime    = s.get("regime", "unclear")
+
+    strong_status     = status in {"at_fvg", "at_order_block", "at_fvg_and_order_block"}
+    strong_confluence = status == "at_fvg_and_order_block"
+
+    # Defensive conditions → Model B has priority
+    defensive = (
+        regime == "chop"
+        or choch_age >= 4
+        or entry_ext > 0.25
+        or category == "secondary_quality"
+        or status == "confluence_zone"
+        or mps < 75
+        or (macd != "yes" and not strong_confluence)
+    )
+
+    if defensive:
+        return "Model B"
+
+    if category == "premium_setup":
         return "Model A"
-    if s["mps"] >= 75 and s["macd_5m"] == "yes" and s["entry_ext"] <= 0.25:
+
+    if category == "high_quality" and mps >= 75:
         return "Model A"
-    if s["status"] in ("at_fvg","at_order_block","at_fvg_and_order_block") and s["macd_5m"] == "yes":
+
+    if macd == "yes" and entry_ext <= 0.25 and strong_status:
         return "Model A"
+
     return "Model B"

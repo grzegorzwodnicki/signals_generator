@@ -274,7 +274,7 @@ def analyze_liquidity(candles, tol=0.003):
     if not any(abs(x["level"] - rl) / rl <= tol for x in below):
         below.append({"level": rl, "count": 1, "type": "Period Low", "score": 6})
 
-    above.sort(key=lambda x: x["level"])
+    above.sort(key=lambda x: x["level"], reverse=True)
     below.sort(key=lambda x: x["level"], reverse=True)
 
     eq_h = [x for x in cl_h if x["count"] >= 2]
@@ -578,7 +578,7 @@ def generate_report(symbol, data_by_tf, report_time, data_time, is_backtest):
         _merge_into(merged_above, liq["above"], TF_LABEL[tf])
         _merge_into(merged_below, liq["below"], TF_LABEL[tf])
 
-    merged_above.sort(key=lambda x: x["level"])
+    merged_above.sort(key=lambda x: x["level"], reverse=True)
     merged_below.sort(key=lambda x: x["level"], reverse=True)
 
     def _liq_row(x, arrow, bg):

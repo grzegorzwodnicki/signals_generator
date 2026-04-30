@@ -130,17 +130,28 @@ python research/backtest.py
 
 Interactive prompts: start date, end date (`dd/mm/yyyy hh:mm`), scan interval (hours), number of symbols to scan.
 
-**Trade model:** entry → TP1a at 1.1R (SL moves to BE + 0.2%) → TP2 at 3.0R full close (win) or SL hit → −1R loss / 0R BE.
+**Trade model — limit order simulation:**
+1. Signal detected → `pending_order` placed at `entry_mid`, TTL = next scan timestamp.
+2. 5M candles in window `(signal_ts, ttl_ts]` are checked: LONG fill if `low ≤ entry`, SHORT fill if `high ≥ entry`.
+3. Fill → `activate_trade()` sets `entry_ts` to the fill candle; exits tracked from that point.
+4. No fill by TTL → order cancelled, new scan at same step.
+5. Active trade: TP1a at 1.1R (SL moves to BE + 0.2%) → TP2 at 3.0R full close (win) or SL hit → −1R loss / 0R BE.
+
+HTML trade log shows three time columns: **Signal Time** (when detected) · **Fill Time** (when limit hit) · **Exit Time**.
 
 **Caching:** OHLCV data is fetched once per run and saved to `research/cache/bt_{start}_{end}_top{N}.json`. Subsequent runs with same params reuse the cache. Multi-batch fetching includes 400-candle lookback before `start_ms`.
 
 **Key functions:**
 - `fetch_full_candles()` — multi-batch Bybit fetch with dedup + chronological sort
 - `slice_at(candles, ts)` — binary search slice for "data available at time T" simulation
+- `check_pending_fill(pending, candles_5m)` — scans 5M window for limit order fill
+- `activate_trade(pending, fill_candle)` — converts pending → active trade at fill timestamp
 - `check_exits(trade, candles_5m)` — applies TP1a / TP2 / SL against 5M OHLCV
-- `run_backtest()` — main loop; uses `ThreadPoolExecutor` via `sg.analyze_symbol()`
+- `run_backtest()` — main loop: pending fill check → exit check → signal scan
 - `compute_stats()` — win rate, total R, avg win/loss R, max drawdown R, profit factor, equity curve
 - `generate_report()` — dark-mode HTML with equity curve SVG + stats cards + full trade log
+
+Raw data dicts include a `_turnover` float key alongside timeframe lists — always filter with `isinstance(c, list)` when iterating `.items()` before passing to `slice_at()`.
 
 Output: `research/results/backtest_{start}_{end}.html`, auto-opens Chrome.
 

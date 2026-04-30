@@ -156,6 +156,45 @@ def build_symbol_data(raw_data, sym, until_ts):
     }
 
 # ============================================================
+# LIMIT ORDER — FILL CHECK
+# ============================================================
+
+def check_pending_fill(pending, candles_5m_all):
+    """
+    Szuka świecy 5M która dotknęła ceny entry w oknie (signal_ts, ttl_ts].
+    LONG fill: low <= entry.  SHORT fill: high >= entry.
+    Zwraca świecę fill lub None.
+    """
+    signal_ts = pending["signal_ts"]
+    ttl_ts    = pending["ttl_ts"]
+    entry     = pending["entry"]
+    direction = pending["direction"]
+
+    for c in candles_5m_all:
+        if c["time"] <= signal_ts or c["time"] > ttl_ts:
+            continue
+        if direction == "LONG"  and c["low"]  <= entry:
+            return c
+        if direction == "SHORT" and c["high"] >= entry:
+            return c
+    return None
+
+
+def activate_trade(pending, fill_candle):
+    """Zamienia pending_order w aktywny trade po uruchomieniu limitu."""
+    trade = {k: v for k, v in pending.items() if k not in ("ttl_ts",)}
+    trade["entry_ts"]   = fill_candle["time"]
+    trade["entry_time"] = datetime.fromtimestamp(fill_candle["time"]).strftime("%Y-%m-%d %H:%M")
+    trade["result"]     = "open"
+    trade["exit_time"]  = None
+    trade["exit_ts"]    = None
+    trade["exit_price"] = None
+    trade["pnl_r"]      = None
+    trade["tp1a_hit"]   = False
+    return trade
+
+
+# ============================================================
 # TRADE EXIT CHECKER
 # ============================================================
 
@@ -237,13 +276,18 @@ def _exit_result(candle, exit_price, result, pnl_r, risk, entry, tp1a_hit):
 # ============================================================
 
 def run_backtest(raw_data, symbols, start_dt, end_dt, scan_interval_h):
-    """Główna pętla backtestu — krok po kroku przez czas."""
-    open_trade = None
-    trades     = []
-    skipped    = 0
+    """Główna pętla backtestu — limit order model.
+    Sygnał → pending limit order (TTL = następny skan).
+    Jeśli cena dotknie entry w oknie → fill → aktywny trade.
+    Jeśli nie → anuluj, szukaj nowego sygnału.
+    """
+    open_trade    = None
+    pending_order = None
+    trades        = []
+    cancelled     = 0
 
-    btc_raw  = raw_data.get("BTCUSDT", {})
-    eth_raw  = raw_data.get("ETHUSDT", {})
+    btc_raw = raw_data.get("BTCUSDT", {})
+    eth_raw = raw_data.get("ETHUSDT", {})
 
     steps = []
     cur = start_dt
@@ -251,34 +295,47 @@ def run_backtest(raw_data, symbols, start_dt, end_dt, scan_interval_h):
         steps.append(cur)
         cur += timedelta(hours=scan_interval_h)
 
+    scan_sec = int(scan_interval_h * 3600)
     print(f"\n  Kroków symulacji: {len(steps)}  |  Symboli: {len(symbols)}")
 
     for step_i, step_dt in enumerate(steps):
-        ts    = int(step_dt.timestamp())
-        ts_ms = ts * 1000
-
+        ts       = int(step_dt.timestamp())
+        next_ts  = int(steps[step_i + 1].timestamp()) if step_i + 1 < len(steps) else ts + scan_sec
         step_str = step_dt.strftime("%Y-%m-%d %H:%M")
 
-        # ── Sprawdź czy otwarty trade się zamknął ──────────────────
+        # ── 1. Sprawdź czy pending limit order został uruchomiony ──────
+        if pending_order and not open_trade:
+            sym        = pending_order["symbol"]
+            candles_5m = slice_at(raw_data.get(sym, {}).get("5m", []), ts)
+            fill       = check_pending_fill(pending_order, candles_5m)
+
+            if fill:
+                open_trade    = activate_trade(pending_order, fill)
+                pending_order = None
+                print(f"  ✅ FILL  {open_trade['symbol']:12} {open_trade['direction']:5}"
+                      f"  limit={open_trade['entry']:.6g}  filled @ {open_trade['entry_time']}")
+            else:
+                cancelled += 1
+                print(f"  ⛔ CANCEL {pending_order['symbol']:12} limit nie uruchomiony — wygasł")
+                pending_order = None
+
+        # ── 2. Sprawdź czy otwarty trade się zamknął ───────────────────
         if open_trade:
-            sym         = open_trade["symbol"]
-            candles_5m  = slice_at(raw_data.get(sym, {}).get("5m", []), ts)
+            sym        = open_trade["symbol"]
+            candles_5m = slice_at(raw_data.get(sym, {}).get("5m", []), ts)
             exit_result = check_exits(open_trade, candles_5m)
 
             if exit_result:
                 open_trade.update(exit_result)
                 trades.append(open_trade)
-                icon = "✅" if "win" in exit_result["result"] else ("⚖" if exit_result["result"]=="be_exit" else "❌")
+                icon = "✅" if "win" in exit_result["result"] else ("⚖" if exit_result["result"] == "be_exit" else "❌")
                 print(f"  {icon} EXIT  {open_trade['symbol']:12} {open_trade['direction']:5} "
                       f"{exit_result['result']:10}  {exit_result['pnl_r']:+.2f}R  @ {exit_result['exit_time']}")
                 open_trade = None
             else:
-                # Trade nadal otwarty — czekamy
-                skipped += 1
-                continue
+                continue  # trade nadal otwarty — czekamy
 
-        # ── Brak otwartego trade → szukaj sygnałów ─────────────────
-        # Market regime
+        # ── 3. Brak aktywnego stanu → szukaj sygnałów ─────────────────
         btc_sliced = {tf: slice_at(c, ts) for tf, c in btc_raw.items() if isinstance(c, list)} if btc_raw else {}
         eth_sliced = {tf: slice_at(c, ts) for tf, c in eth_raw.items() if isinstance(c, list)} if eth_raw else {}
         regime = sg.market_regime(
@@ -307,37 +364,40 @@ def run_backtest(raw_data, symbols, start_dt, end_dt, scan_interval_h):
         print(f"  [{step_i+1:3}/{len(steps)}] {step_str}  regime={regime:8}  {found_str}")
 
         if top1:
-            open_trade = {
-                "symbol":    top1["symbol"],
-                "direction": top1["direction"],
-                "entry":     top1["entry_mid"],
-                "sl":        top1["sl"],
-                "tp1a":      top1["tp1a"],
-                "tp1b":      top1["tp1b"],
-                "tp2":       top1["tp2"],
-                "rr":        top1["rr"],
-                "risk":      top1["risk"],
-                "mps":       top1["mps"],
-                "ts_score":  top1["ts"],
-                "category":  top1.get("category", ""),
-                "model":     top1.get("model", ""),
-                "wyckoff":   top1["wyckoff"]["pattern"],
-                "status":    top1["status"],
-                "macd_5m":   top1.get("macd_5m", "none"),
-                "choch_age": top1["choch_age"],
-                "entry_ext": top1["entry_ext"],
-                "entry_time": step_str,
-                "entry_ts":  ts,
-                "exit_time":  None,
-                "exit_ts":    None,
-                "exit_price": None,
-                "result":     "open",
-                "pnl_r":      None,
-                "tp1a_hit":   False,
+            pending_order = {
+                "symbol":      top1["symbol"],
+                "direction":   top1["direction"],
+                "entry":       top1["entry_mid"],
+                "sl":          top1["sl"],
+                "tp1a":        top1["tp1a"],
+                "tp1b":        top1["tp1b"],
+                "tp2":         top1["tp2"],
+                "rr":          top1["rr"],
+                "risk":        top1["risk"],
+                "mps":         top1["mps"],
+                "ts_score":    top1["ts"],
+                "category":    top1.get("category", ""),
+                "model":       top1.get("model", ""),
+                "wyckoff":     top1["wyckoff"]["pattern"],
+                "status":      top1["status"],
+                "macd_5m":     top1.get("macd_5m", "none"),
+                "choch_age":   top1["choch_age"],
+                "entry_ext":   top1["entry_ext"],
+                "signal_time": step_str,
+                "signal_ts":   ts,
+                "ttl_ts":      next_ts,
+                "entry_time":  None,
+                "entry_ts":    None,
+                "exit_time":   None,
+                "exit_ts":     None,
+                "exit_price":  None,
+                "result":      "pending",
+                "pnl_r":       None,
+                "tp1a_hit":    False,
             }
             icon = "🔵 LONG " if top1["direction"] == "LONG" else "🔴 SHORT"
-            print(f"       → ENTRY {icon}  {top1['symbol']:12}  MPS={top1['mps']}  "
-                  f"entry={top1['entry_mid']:.4f}  sl={top1['sl']:.4f}  tp2={top1['tp2']:.4f}")
+            print(f"       → LIMIT {icon}  {top1['symbol']:12}  MPS={top1['mps']}  "
+                  f"entry={top1['entry_mid']:.6g}  TTL={datetime.fromtimestamp(next_ts).strftime('%Y-%m-%d %H:%M')}")
 
     # Zamknij jeśli trade otwarty na końcu okresu
     if open_trade:
@@ -347,6 +407,10 @@ def run_backtest(raw_data, symbols, start_dt, end_dt, scan_interval_h):
         trades.append(open_trade)
         print(f"  ⏳ OPEN  {open_trade['symbol']}  (otwarty na końcu okresu)")
 
+    if pending_order:
+        print(f"  ⛔ PENDING {pending_order['symbol']}  (wygasł na końcu okresu — nie uruchomiony)")
+
+    print(f"\n  Łącznie transakcji: {len(trades)}  |  Anulowane limity: {cancelled}")
     return trades
 
 # ============================================================
@@ -477,12 +541,14 @@ def generate_report(trades, stats, meta):
         rc  = result_colors.get(t["result"], "#8899aa")
         dc  = "#00ff8c" if t["direction"] == "LONG" else "#ff4d4d"
         r_s = f'{t["pnl_r"]:+.2f}R' if t["pnl_r"] is not None else "open"
+        mc  = "#00ff8c" if t.get("macd_5m") == "yes" else "#888"
         rows += (
             f'<tr>'
             f'<td>{i}</td>'
             f'<td style="font-weight:bold">{t["symbol"]}</td>'
             f'<td style="color:{dc}">{t["direction"]}</td>'
-            f'<td>{t["entry_time"]}</td>'
+            f'<td style="color:#8899aa;font-size:11px">{t.get("signal_time") or "—"}</td>'
+            f'<td>{t.get("entry_time") or "—"}</td>'
             f'<td>{t.get("exit_time") or "—"}</td>'
             f'<td>{_f(t["entry"])}</td>'
             f'<td style="color:#ff4d4d">{_f(t["sl"])}</td>'
@@ -494,7 +560,7 @@ def generate_report(trades, stats, meta):
             f'<td>{t["mps"]}</td>'
             f'<td style="color:#8899aa;font-size:11px">{t.get("wyckoff","")}</td>'
             f'<td style="color:#8899aa;font-size:11px">{t.get("status","").replace("_"," ")}</td>'
-            f'<td style="color:{"#00ff8c" if t.get("macd_5m")=="yes" else "#888"}">{t.get("macd_5m","")}</td>'
+            f'<td style="color:{mc}">{t.get("macd_5m","")}</td>'
             f'<td>{t.get("choch_age","")}</td>'
             f'</tr>'
         )
@@ -545,7 +611,7 @@ def generate_report(trades, stats, meta):
     <table style="width:100%;border-collapse:collapse;font-size:12px">
       <thead>
         <tr>
-          <th>#</th><th>Symbol</th><th>Dir</th><th>Entry Time</th><th>Exit Time</th>
+          <th>#</th><th>Symbol</th><th>Dir</th><th>Signal Time</th><th>Fill Time</th><th>Exit Time</th>
           <th>Entry</th><th>SL</th><th>TP1a</th><th>TP2</th><th>Exit Price</th>
           <th>Result</th><th>P&L R</th><th>MPS</th><th>Wyckoff</th><th>Status</th><th>MACD</th><th>ChoCH</th>
         </tr>

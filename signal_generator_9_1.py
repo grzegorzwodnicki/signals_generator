@@ -9,6 +9,7 @@ import requests
 import time
 import threading
 import os
+import subprocess
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -156,27 +157,36 @@ def swing_points(candles, lb=4):
 # ============================================================
 
 def detect_wyckoff(candles_1h):
-    if not candles_1h or len(candles_1h) < 40:
+    if not candles_1h or len(candles_1h) < 35:
         return None
 
-    # Kontekst: 80 świec temu do 5 ostatnich
-    ctx  = candles_1h[-80:-5] if len(candles_1h) > 85 else candles_1h[:-5]
-    tail = candles_1h[-10:]   # najnowsze 10
+    # Krótszy, bardziej aktualny kontekst: ostatnie 45 świec (z wyłączeniem 3 ostatnich)
+    ctx  = candles_1h[-45:-3] if len(candles_1h) > 48 else candles_1h[:-3]
+    tail = candles_1h[-15:]   # najnowsze 15 świec do wykrycia SOS/SOW
 
-    if len(ctx) < 20:
+    if len(ctx) < 15:
         return None
 
-    rh = max(c["high"] for c in ctx)
-    rl = min(c["low"]  for c in ctx)
+    # Percentyl 80/20 zamiast absolutnego max/min — odporny na spike'i i trendy
+    highs_sorted = sorted(c["high"] for c in ctx)
+    lows_sorted  = sorted(c["low"]  for c in ctx)
+    n   = len(highs_sorted)
+    rh  = highs_sorted[int(n * 0.80)]
+    rl  = lows_sorted[int(n * 0.20)]
+
     rng = rh - rl
-    if rng == 0 or rng / rh > 0.20 or rng / rh < 0.003:
+    mid = (rh + rl) / 2
+    if rng == 0 or mid == 0:
+        return None
+    rng_ratio = rng / mid
+    if rng_ratio > 0.30 or rng_ratio < 0.002:
         return None
 
     last_close = candles_1h[-1]["close"]
 
-    # SOS — wybicie powyżej range_high
+    # SOS — zamknięcie powyżej rh (bullish candle)
     sos = any(c["close"] > rh and c["close"] > c["open"] for c in tail)
-    # SOW — wybicie poniżej range_low
+    # SOW — zamknięcie poniżej rl (bearish candle)
     sow = any(c["close"] < rl and c["close"] < c["open"] for c in tail)
 
     if sos == sow:      # oba lub żaden — niejednoznaczne
@@ -189,20 +199,20 @@ def detect_wyckoff(candles_1h):
     # Phase D: minimum 1 świeca akceptacji poza range
     if sos:
         phase_d  = sum(1 for c in tail if c["close"] > rh) >= 1
-        pullback = last_close <= rh * 1.015
+        pullback = last_close <= rh * 1.025   # luzniejszy pullback
     else:
         phase_d  = sum(1 for c in tail if c["close"] < rl) >= 1
-        pullback = last_close >= rl * 0.985
+        pullback = last_close >= rl * 0.975
 
     return {
-        "pattern":   pattern,
-        "direction": direction,
-        "event":     event,
-        "range_high": rh,
-        "range_low":  rl,
+        "pattern":      pattern,
+        "direction":    direction,
+        "event":        event,
+        "range_high":   rh,
+        "range_low":    rl,
         "range_height": rng,
-        "phase_d":   phase_d,
-        "pullback":  pullback,
+        "phase_d":      phase_d,
+        "pullback":     pullback,
     }
 
 # ============================================================
@@ -232,16 +242,24 @@ def detect_fvg(candles, direction, lookback=120):
 # ORDER BLOCK
 # ============================================================
 
-def detect_ob(candles, direction, lookback=120):
+def detect_ob(candles, direction, lookback=150):
     src = candles[-lookback:] if len(candles) > lookback else candles
     ob  = None
     for i in range(1, len(src) - 2):
         c, nx = src[i], src[i+1]
+        if c["open"] == 0:
+            continue
         if direction == "LONG":
-            if c["close"] < c["open"] and nx["close"] > c["high"] and (nx["close"] - nx["open"]) / c["open"] > 0.002:
+            # Ostatnia bearish świeca przed bullish displacement
+            if (c["close"] < c["open"] and
+                    nx["close"] > c["open"] and           # zamknięcie powyżej open poprzedniej (luźniejsze)
+                    (nx["close"] - nx["open"]) / c["open"] > 0.001):
                 ob = {"ob_low": c["low"], "ob_high": c["high"]}
         else:
-            if c["close"] > c["open"] and nx["close"] < c["low"] and (c["open"] - nx["close"]) / c["open"] > 0.002:
+            # Ostatnia bullish świeca przed bearish displacement
+            if (c["close"] > c["open"] and
+                    nx["close"] < c["open"] and
+                    (c["open"] - nx["close"]) / c["open"] > 0.001):
                 ob = {"ob_low": c["low"], "ob_high": c["high"]}
     if ob:
         ob["mid"] = (ob["ob_low"] + ob["ob_high"]) / 2
@@ -253,11 +271,12 @@ def detect_ob(candles, direction, lookback=120):
 
 def detect_choch(candles_5m, direction):
     src = candles_5m[-100:] if len(candles_5m) > 100 else candles_5m
-    if len(src) < 15:
+    if len(src) < 10:
         return None
-    for i in range(len(src)-1, max(len(src)-20, 5), -1):
+    # Szukaj dalej wstecz (30 świec) i z mniejszym oknem lokalnym (5 świec)
+    for i in range(len(src)-1, max(len(src)-30, 3), -1):
         c = src[i]
-        win = src[max(0, i-10):i]
+        win = src[max(0, i-5):i]   # okno 5 świec (było 10) — łatwiej przebić lokalne high/low
         if not win:
             continue
         if direction == "LONG":
@@ -414,8 +433,8 @@ def analyze_symbol(symbol, data, regime):
     else:
         return None
 
-    # ChoCH wymagany
-    if not choch or not choch.get("confirmed") or choch["candles_ago"] > 4:
+    # ChoCH wymagany (max 6 świec — 5-6 trafi do watchlist w classify)
+    if not choch or not choch.get("confirmed") or choch["candles_ago"] > 6:
         return None
 
     choch_age = choch["candles_ago"]
@@ -452,8 +471,8 @@ def analyze_symbol(symbol, data, regime):
         status    = "at_order_block"
 
     else:
-        # Confluence zone: cena w pobliżu range high/low
-        near = rng * 0.05
+        # Confluence zone: cena w pobliżu range high/low — promień 15% range height
+        near = rng * 0.15
         if direction == "LONG" and abs(price - rh) <= near:
             status    = "confluence_zone"
             entry_mid = price
@@ -653,23 +672,31 @@ def classify(s):
     mps = s["mps"]
     if ts < 0 or mps < 0 or s["macd_5m"] == "against" or s["entry_ext"] > 0.50:
         return "rejected"
-    if s["choch_age"] > 4 or s["rr"] < 2.0:
+    if s["choch_age"] > 6 or s["rr"] < 2.0:
         return "rejected"
-    if "Pin" in s["pattern_type"]:
-        if ts >= 85 and s["choch_age"] <= 1 and s["macd_5m"] == "yes" and s["entry_ext"] <= 0.25:
-            return "secondary_quality"
-        return "watchlist"
-    if ts < 73:
-        return "watchlist"
 
     st  = s["status"]
     ee  = s["entry_ext"]
     age = s["choch_age"]
     m   = s["macd_5m"]
 
-    # Confluence zone — specjalne zasady
+    # Stare ChoCH (5-6c) → zawsze watchlist
+    if age > 4:
+        return "watchlist"
+
+    if "Pin" in s["pattern_type"]:
+        if ts >= 75 and age <= 2 and m == "yes" and ee <= 0.35:
+            return "secondary_quality"
+        return "watchlist"
+
+    # Obniżony próg z 73 → 65
+    if ts < 65:
+        return "watchlist"
+
+    # Confluence zone — złagodzone zasady
     if st == "confluence_zone":
-        if not (m == "yes" and age <= 2 and ee <= 0.25):
+        # Wystarczy: (MACD yes LUB entry_ext <= 0.25) AND ChoCH <= 3
+        if not ((m == "yes" or ee <= 0.25) and age <= 3):
             return "watchlist"
 
     # Premium
@@ -680,8 +707,8 @@ def classify(s):
         return "premium_setup"
 
     # High quality
-    if (ee <= 0.25 and "Engulfing" in s["pattern_type"] and m in ("yes","none") and
-            st in ("at_fvg","at_order_block","at_fvg_and_order_block") and age <= 3):
+    if (ee <= 0.35 and "Engulfing" in s["pattern_type"] and m in ("yes","none") and
+            st in ("at_fvg","at_order_block","at_fvg_and_order_block") and age <= 4):
         return "high_quality"
 
     return "secondary_quality"
@@ -1258,7 +1285,18 @@ def main():
         f.write(html)
 
     print(f"\n✅ Raport: {outfile}")
-    print(f"   Aktywnych setupów: {active_count}  |  Otwórz w przeglądarce.")
+    print(f"   Aktywnych setupów: {active_count}")
+
+    abs_path = os.path.abspath(outfile)
+    try:
+        subprocess.Popen(["open", "-a", "Google Chrome", abs_path])
+        print("   Otwieranie w Google Chrome...")
+    except FileNotFoundError:
+        try:
+            subprocess.Popen(["open", abs_path])
+            print("   Chrome nie znaleziony — otwieranie domyślną przeglądarką...")
+        except Exception as e:
+            print(f"   Nie udało się otworzyć przeglądarki: {e}")
 
 if __name__ == "__main__":
     main()

@@ -5,19 +5,32 @@ Pobiera top 400 kryptowalut z Bybit, analizuje setupy tradingowe
 i generuje pełny raport HTML.
 """
 
+import os
 import requests
 import time
 import threading
-import os
 import subprocess
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+def _load_env():
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(env_path):
+        return
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, _, val = line.partition("=")
+                os.environ.setdefault(key.strip(), val.strip())
+
+_load_env()
+
 # ============================================================
 # KONFIGURACJA
 # ============================================================
-API_KEY    = "ZNTnlQsdBl5p2K6Dms"
-API_SECRET = "aExm2IsrMGveuYaXOxrxmzVJaAPnyCrAOdAH"
+API_KEY    = os.environ.get("BYBIT_API_KEY", "")
+API_SECRET = os.environ.get("BYBIT_API_SECRET", "")
 
 OUTPUT_DIR          = "output"
 TOP_N               = 400

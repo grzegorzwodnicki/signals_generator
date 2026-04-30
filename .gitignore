@@ -1,5 +1,8 @@
+.env
 output
 venv
 research/cache
 research/output
 research/results
+strategy_9_1/cache
+strategy_9_1/results

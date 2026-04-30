@@ -185,46 +185,107 @@ def analyze_wyckoff(candles):
 # LIQUIDITY
 # ============================================================
 
+_LB_RANK = {"major": 3, "intermediate": 2, "minor": 1}
+
 def analyze_liquidity(candles, tol=0.003):
+    """
+    Wykrywa poziomy liquidity w trzech oknach swingów:
+      lb=3 → minor, lb=5 → intermediate, lb=8 → major
+    Zwraca wszystkie znaczące poziomy (nie tylko equal) z etykietą siły.
+    """
     if not candles or len(candles) < 10:
         return {}
 
-    src  = candles[-60:] if len(candles) > 60 else candles
+    src  = candles[-150:] if len(candles) > 150 else candles
     last = candles[-1]["close"]
-    sw_h, sw_l = swing_points(src, lb=3)
 
-    def cluster(points):
-        seen = []
-        for p in points:
-            price = p["price"]
+    # Zbierz swingi z trzech okien
+    raw_h, raw_l = [], []
+    for lb, label in [(3, "minor"), (5, "intermediate"), (8, "major")]:
+        sh, sl = swing_points(src, lb=lb)
+        for p in sh:
+            raw_h.append({"price": p["price"], "lb_type": label})
+        for p in sl:
+            raw_l.append({"price": p["price"], "lb_type": label})
+
+    def cluster(raw):
+        levels = []
+        for p in sorted(raw, key=lambda x: x["price"]):
+            price, lb_type = p["price"], p["lb_type"]
             merged = False
-            for s in seen:
-                if abs(price - s["level"]) / s["level"] <= tol:
-                    s["level"] = (s["level"] * s["count"] + price) / (s["count"] + 1)
-                    s["count"] += 1
+            for lv in levels:
+                if abs(price - lv["level"]) / lv["level"] <= tol:
+                    n = lv["count"]
+                    lv["level"] = (lv["level"] * n + price) / (n + 1)
+                    lv["count"] += 1
+                    if _LB_RANK.get(lb_type, 0) > _LB_RANK.get(lv["best_type"], 0):
+                        lv["best_type"] = lb_type
                     merged = True
                     break
             if not merged:
-                seen.append({"level": price, "count": 1})
-        return seen
+                levels.append({"level": price, "count": 1, "best_type": lb_type})
+        return levels
 
-    eq_h = [x for x in cluster(sw_h) if x["count"] >= 2]
-    eq_l = [x for x in cluster(sw_l) if x["count"] >= 2]
+    def label_level(lv, side):
+        if lv.get("force_type"):
+            return lv["force_type"]
+        equal = lv["count"] >= 2
+        bt    = lv.get("best_type", "minor")
+        if equal:
+            return "EQH" if side == "high" else "EQL"
+        if bt == "major":
+            return "Major SH" if side == "high" else "Major SL"
+        if bt == "intermediate":
+            return "Swing H" if side == "high" else "Swing L"
+        return "Minor SH" if side == "high" else "Minor SL"
+
+    def score(lv):
+        return lv["count"] * _LB_RANK.get(lv.get("best_type", "minor"), 1)
+
+    cl_h = cluster(raw_h)
+    cl_l = cluster(raw_l)
 
     rh = max(c["high"] for c in src)
     rl = min(c["low"]  for c in src)
 
-    above = sorted([x for x in eq_h if x["level"] > last], key=lambda x: x["level"])
-    below = sorted([x for x in eq_l if x["level"] < last], key=lambda x: x["level"], reverse=True)
-    above.append({"level": rh, "count": 1, "type": "Range High"})
-    below.append({"level": rl, "count": 1, "type": "Range Low"})
+    above, below = [], []
+
+    for lv in cl_h:
+        if lv["level"] > last:
+            above.append({
+                "level":  lv["level"],
+                "count":  lv["count"],
+                "type":   label_level(lv, "high"),
+                "score":  score(lv),
+            })
+
+    for lv in cl_l:
+        if lv["level"] < last:
+            below.append({
+                "level":  lv["level"],
+                "count":  lv["count"],
+                "type":   label_level(lv, "low"),
+                "score":  score(lv),
+            })
+
+    # Dodaj ekstrema okresu (jeśli nie zduplikowane)
+    if not any(abs(x["level"] - rh) / rh <= tol for x in above):
+        above.append({"level": rh, "count": 1, "type": "Period High", "score": 6})
+    if not any(abs(x["level"] - rl) / rl <= tol for x in below):
+        below.append({"level": rl, "count": 1, "type": "Period Low", "score": 6})
+
+    above.sort(key=lambda x: x["level"])
+    below.sort(key=lambda x: x["level"], reverse=True)
+
+    eq_h = [x for x in cl_h if x["count"] >= 2]
+    eq_l = [x for x in cl_l if x["count"] >= 2]
 
     return {
         "equal_highs": eq_h, "equal_lows": eq_l,
-        "range_high": rh, "range_low": rl,
-        "above": sorted(above, key=lambda x: x["level"]),
-        "below": sorted(below, key=lambda x: x["level"], reverse=True),
-        "last":  last,
+        "range_high":  rh,   "range_low":  rl,
+        "above":       above,
+        "below":       below,
+        "last":        last,
     }
 
 # ============================================================
@@ -466,45 +527,98 @@ def generate_report(symbol, data_by_tf, report_time, data_time, is_backtest):
         f'</tr></thead><tbody style="color:#e6edf7">{wy_rows}</tbody></table></div>'
     )
 
-    # ── Liquidity map (use 1H primary, fallback 4H) ──
-    liq_html = ""
-    for tf_try in ["1H", "4H", "15m"]:
-        a = A.get(tf_try)
-        if not a or not a.get("liquidity"): continue
-        liq  = a["liquidity"]
-        last = liq["last"]
-        above = liq["above"][:5]
-        below = liq["below"][:5]
+    # ── Liquidity map — skonsolidowana multi-TF ──
+    _TYPE_COLOR = {
+        "EQH": "#00ff8c", "EQL": "#ff4d4d",
+        "Period High": "#00ffcc", "Period Low": "#ff8866",
+        "Major SH": "#00e5ff", "Major SL": "#ff6688",
+        "Swing H": "#88ddff", "Swing L": "#ff99aa",
+        "Minor SH": "#aabbcc", "Minor SL": "#aabbcc",
+    }
 
-        a_html = "".join(
-            f'<div style="display:flex;justify-content:space-between;padding:3px 6px;'
-            f'background:#0a1a0a;border-radius:3px;margin:2px 0">'
-            f'<span style="color:#00ff8c">▲ {_f(x["level"])}</span>'
-            f'<span style="color:#8899aa;font-size:11px">'
-            f'{"Equal highs ×"+str(x["count"]) if x.get("count",1)>1 else x.get("type","Swing high")}</span></div>'
-            for x in above
-        ) or "<div style='color:#556677;font-size:12px'>None</div>"
+    # Zbierz poziomy ze wszystkich TF i scal po tolerancji 0.4%
+    merged_above, merged_below = [], []
+    tol_merge = 0.004
+    cur_price  = None
 
-        b_html = "".join(
-            f'<div style="display:flex;justify-content:space-between;padding:3px 6px;'
-            f'background:#1a0a0a;border-radius:3px;margin:2px 0">'
-            f'<span style="color:#ff4d4d">▼ {_f(x["level"])}</span>'
-            f'<span style="color:#8899aa;font-size:11px">'
-            f'{"Equal lows ×"+str(x["count"]) if x.get("count",1)>1 else x.get("type","Swing low")}</span></div>'
-            for x in below
-        ) or "<div style='color:#556677;font-size:12px'>None</div>"
+    for tf in TIMEFRAMES:
+        a = A.get(tf)
+        if not a or not a.get("liquidity"):
+            continue
+        liq = a["liquidity"]
+        if cur_price is None:
+            cur_price = liq["last"]
 
-        liq_html = (
-            f'<div style="font-size:12px;color:#8899aa;margin-bottom:8px">'
-            f'{TF_LABEL[tf_try]} — Price: <strong style="color:#e6edf7">{_f(last)}</strong></div>'
-            f'<div style="font-size:12px;color:#00ff8c;margin-bottom:4px">▲ Above price liquidity</div>'
-            f'{a_html}'
-            f'<div style="text-align:center;padding:5px;background:#0d1520;margin:6px 0;'
-            f'font-size:12px;color:#ffd700;border-radius:4px">── Current Price: {_f(last)} ──</div>'
-            f'<div style="font-size:12px;color:#ff4d4d;margin-bottom:4px">▼ Below price liquidity</div>'
-            f'{b_html}'
+        def _merge_into(target, levels, tf_label):
+            for lv in levels:
+                existing = next(
+                    (x for x in target
+                     if abs(x["level"] - lv["level"]) / max(x["level"], 0.0001) <= tol_merge),
+                    None
+                )
+                if existing:
+                    n = existing["count"]
+                    existing["level"] = (existing["level"] * n + lv["level"]) / (n + 1)
+                    existing["count"] += 1
+                    existing["score"] = existing.get("score", 1) + lv.get("score", 1)
+                    if tf_label not in existing["tfs"]:
+                        existing["tfs"].append(tf_label)
+                    # Upgrade type if stronger
+                    rank = {"EQH":7,"EQL":7,"Period High":6,"Period Low":6,
+                            "Major SH":5,"Major SL":5,"Swing H":3,"Swing L":3,
+                            "Minor SH":1,"Minor SL":1}
+                    if rank.get(lv.get("type",""),0) > rank.get(existing.get("type",""),0):
+                        existing["type"] = lv["type"]
+                else:
+                    entry = dict(lv)
+                    entry["tfs"] = [tf_label]
+                    entry.setdefault("score", 1)
+                    target.append(entry)
+
+        _merge_into(merged_above, liq["above"], TF_LABEL[tf])
+        _merge_into(merged_below, liq["below"], TF_LABEL[tf])
+
+    merged_above.sort(key=lambda x: x["level"])
+    merged_below.sort(key=lambda x: x["level"], reverse=True)
+
+    def _liq_row(x, arrow, bg):
+        lv_type  = x.get("type", "Level")
+        col      = _TYPE_COLOR.get(lv_type, "#aabbcc")
+        count    = x.get("count", 1)
+        tfs_str  = " · ".join(x.get("tfs", []))
+        touches  = f" ×{count}" if count > 1 else ""
+        strength = "●" * min(x.get("score", 1), 5)
+        return (
+            f'<div style="display:flex;justify-content:space-between;align-items:center;'
+            f'padding:3px 6px;background:{bg};border-radius:3px;margin:2px 0">'
+            f'<span style="color:{col};font-weight:bold">{arrow} {_f(x["level"])}</span>'
+            f'<span style="display:flex;align-items:center;gap:8px">'
+            f'<span style="color:{col};font-size:11px">{lv_type}{touches}</span>'
+            f'<span style="color:#445566;font-size:10px">{tfs_str}</span>'
+            f'<span style="color:{col};font-size:10px;letter-spacing:-1px">{strength}</span>'
+            f'</span></div>'
         )
-        break
+
+    above_rows = "".join(_liq_row(x, "▲", "#0a1a0a") for x in merged_above[:10]) \
+                 or "<div style='color:#556677;font-size:12px'>None detected</div>"
+    below_rows = "".join(_liq_row(x, "▼", "#1a0a0a") for x in merged_below[:10]) \
+                 or "<div style='color:#556677;font-size:12px'>None detected</div>"
+
+    price_label = _f(cur_price) if cur_price else "N/A"
+    liq_html = (
+        f'<div style="font-size:11px;color:#8899aa;margin-bottom:8px">'
+        f'Multi-TF consolidated · Price: <strong style="color:#e6edf7">{price_label}</strong> · '
+        f'● strength score</div>'
+        f'<div style="font-size:12px;color:#00ff8c;margin-bottom:4px">▲ Above price</div>'
+        f'{above_rows}'
+        f'<div style="text-align:center;padding:5px;background:#0d1520;margin:6px 0;'
+        f'font-size:12px;color:#ffd700;border-radius:4px">── {price_label} ──</div>'
+        f'<div style="font-size:12px;color:#ff4d4d;margin-bottom:4px">▼ Below price</div>'
+        f'{below_rows}'
+        f'<div style="margin-top:8px;font-size:10px;color:#445566">'
+        f'EQH/EQL = equal highs/lows · Major/Swing/Minor SH/SL = single significant swing · '
+        f'Period = absolute extreme</div>'
+    )
 
     # ── Sweeps ──
     sw_html = ""

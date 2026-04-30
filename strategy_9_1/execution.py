@@ -196,3 +196,71 @@ def simulate_auto_model(
     if setup.get("model") == "Model A":
         return simulate_model_a(setup, candles_5m, conservative)
     return simulate_model_b(setup, candles_5m, conservative)
+
+
+def simulate_fixed_r(
+    setup: dict,
+    candles_5m: list[dict],
+    tp_mult: float = 2.0,
+    conservative: bool = True,
+) -> dict:
+    """Single-position fixed-R model: SL = -1R, TP = +tp_mult*R. No partial exits."""
+    direction = setup["direction"]
+    entry     = setup["entry_mid"]
+    sl_price  = setup["sl"]
+    risk      = abs(entry - sl_price)
+    if risk == 0:
+        return {
+            "exit_reason": "open", "pnl_r": 0.0,
+            "mfe_r": 0.0, "mae_r": 0.0,
+            "bars_held": 0, "conservative_intrabar": False,
+            "model": f"FIXED_{tp_mult}R", "model_tps": [(tp_mult, 1.0)],
+        }
+    sign     = _sign(direction)
+    tp_price = entry + sign * tp_mult * risk
+    _check   = _intrabar_conservative if conservative else _intrabar_optimistic
+
+    mfe_r = mae_r = 0.0
+    for bar_i, c in enumerate(candles_5m):
+        if direction == "LONG":
+            mfe_r = max(mfe_r, (c["high"] - entry) / risk)
+            mae_r = min(mae_r, (c["low"]  - entry) / risk)
+        else:
+            mfe_r = max(mfe_r, (entry - c["low"])  / risk)
+            mae_r = min(mae_r, (entry - c["high"]) / risk)
+
+        verdict  = _check(c, sl_price, tp_price, direction)
+        both_hit = _crossed_sl(c, sl_price, direction) and _crossed_tp(c, tp_price, direction)
+
+        if verdict == "sl":
+            return {
+                "exit_reason": "sl", "pnl_r": -1.0,
+                "mfe_r": round(mfe_r, 4), "mae_r": round(mae_r, 4),
+                "bars_held": bar_i + 1,
+                "conservative_intrabar": conservative and both_hit,
+                "model": f"FIXED_{tp_mult}R", "model_tps": [(tp_mult, 1.0)],
+            }
+        if verdict == "tp":
+            return {
+                "exit_reason": "tp_full", "pnl_r": tp_mult,
+                "mfe_r": round(mfe_r, 4), "mae_r": round(mae_r, 4),
+                "bars_held": bar_i + 1, "conservative_intrabar": False,
+                "model": f"FIXED_{tp_mult}R", "model_tps": [(tp_mult, 1.0)],
+            }
+
+    return {
+        "exit_reason": "open", "pnl_r": 0.0,
+        "mfe_r": round(mfe_r, 4), "mae_r": round(mae_r, 4),
+        "bars_held": len(candles_5m), "conservative_intrabar": False,
+        "model": f"FIXED_{tp_mult}R", "model_tps": [(tp_mult, 1.0)],
+    }
+
+
+def simulate_fixed_2r(setup, candles_5m, conservative=True):
+    return simulate_fixed_r(setup, candles_5m, 2.0, conservative)
+
+def simulate_fixed_15r(setup, candles_5m, conservative=True):
+    return simulate_fixed_r(setup, candles_5m, 1.5, conservative)
+
+def simulate_fixed_3r(setup, candles_5m, conservative=True):
+    return simulate_fixed_r(setup, candles_5m, 3.0, conservative)

@@ -21,6 +21,7 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import argparse
 import json
 import math
 import time
@@ -56,23 +57,42 @@ _ACTIVE = {"premium_setup", "high_quality", "secondary_quality"}
 # ============================================================
 
 CONFIGS = {
-    "TOP1":       {"top_n": 1,  "categories": _ACTIVE,                          "basket_size": 1},
-    "TOP3":       {"top_n": 3,  "categories": _ACTIVE,                          "basket_size": 3},
-    "PREMIUM":    {"top_n": 99, "categories": {"premium_setup"},                 "basket_size": 1},
-    "HQ":         {"top_n": 99, "categories": {"high_quality"},                  "basket_size": 1},
-    "PREMIUM_HQ": {"top_n": 99, "categories": {"premium_setup", "high_quality"}, "basket_size": 1},
+    "TOP1":       {"top_n": 1,  "categories": _ACTIVE,                          "basket_size": 1, "core_v93": False},
+    "TOP3":       {"top_n": 3,  "categories": _ACTIVE,                          "basket_size": 3, "core_v93": False},
+    "PREMIUM":    {"top_n": 99, "categories": {"premium_setup"},                 "basket_size": 1, "core_v93": False},
+    "HQ":         {"top_n": 99, "categories": {"high_quality"},                  "basket_size": 1, "core_v93": False},
+    "PREMIUM_HQ": {"top_n": 99, "categories": {"premium_setup", "high_quality"}, "basket_size": 1, "core_v93": False},
+    "CORE_V93":   {"top_n": 99, "categories": _ACTIVE,                          "basket_size": 1, "core_v93": True},
 }
 
 MODELS = {
-    "A":    ex.simulate_model_a,
-    "B":    ex.simulate_model_b,
-    "Auto": ex.simulate_auto_model,
+    "A":          ex.simulate_model_a,
+    "B":          ex.simulate_model_b,
+    "Auto":       ex.simulate_auto_model,
+    "FIXED_2R":   ex.simulate_fixed_2r,
+    "FIXED_1_5R": ex.simulate_fixed_15r,
+    "FIXED_3R":   ex.simulate_fixed_3r,
 }
 
 INTRABAR_MODES = {
     "conservative": True,
     "optimistic":   False,
 }
+
+# CORE_V93 hard filter — strictest diagnostic subset
+def _passes_core_v93(setup):
+    fvg_filled = bool((setup.get("fvg") or {}).get("filled", False))
+    return (
+        setup.get("status")    in {"at_fvg", "at_fvg_and_order_block"}
+        and setup.get("entry_ext", 1.0) <= 0.25
+        and setup.get("choch_age", 99)  <= 2
+        and "Engulfing"        in setup.get("pattern_type", "")
+        and setup.get("macd_5m")        != "against"
+        and setup.get("ts",    0)       >= 73
+        and setup.get("mps",   0)       >= 70
+        and not fvg_filled
+        and setup.get("rr",    0)       >= 2.0
+    )
 
 # ============================================================
 # MULTI-BATCH CANDLE FETCHING
@@ -210,22 +230,59 @@ def check_pending_fill(pending, candles_5m_sliced):
 # SINGLE-CONFIG BACKTEST LOOP  (basket-aware)
 # ============================================================
 
+def _trade_record(top, step_dt, ts, next_ts, entry_mode):
+    """Build the shared trade/order dict from a setup."""
+    return {
+        "symbol":      top["symbol"],
+        "direction":   top["direction"],
+        "entry":       top["entry_mid"],
+        "entry_mid":   top["entry_mid"],
+        "sl":          top["sl"],
+        "tp1a":        top.get("tp1a"),
+        "tp1b":        top.get("tp1b"),
+        "tp2":         top.get("tp2"),
+        "tp3":         top.get("tp3"),
+        "rr":          top["rr"],
+        "risk":        top.get("risk"),
+        "mps":         top["mps"],
+        "ts_score":    top["ts"],
+        "category":    top["category"],
+        "model":       top["model"],
+        "wyckoff":     top["wyckoff"]["pattern"],
+        "status":      top["status"],
+        "macd_5m":     top.get("macd_5m", "none"),
+        "choch_age":   top["choch_age"],
+        "entry_ext":   top["entry_ext"],
+        "pattern_type":             top.get("pattern_type", ""),
+        "target_feasibility_score": top.get("target_feasibility_score"),
+        "verdict":                  top.get("verdict"),
+        "signal_time": step_dt.strftime("%Y-%m-%d %H:%M"),
+        "signal_ts":   ts,
+        "ttl_ts":      next_ts,
+        "entry_mode":  entry_mode,
+        "result":      "pending",
+        "pnl_r":       None,
+        "_setup":      top,
+    }
+
+
 def run_config(
     raw_data, symbols, start_dt, end_dt, scan_interval_h,
-    cfg_name, model_name, conservative=True,
+    cfg_name, model_name, conservative=True, entry_mode="limit",
 ):
     cfg         = CONFIGS[cfg_name]
     sim_fn      = MODELS[model_name]
     top_n       = cfg["top_n"]
     allowed     = cfg["categories"]
     basket_size = cfg["basket_size"]
+    use_core    = cfg.get("core_v93", False)
+    market_mode = (entry_mode == "immediate")
 
     active_trades   = []
     pending_orders  = []
     trades          = []
     concurrent_hist = []
 
-    # Pending order stats
     orders = {"created": 0, "filled": 0, "cancelled": 0}
 
     btc_raw = raw_data.get("BTCUSDT", {})
@@ -244,7 +301,7 @@ def run_config(
                    if step_i + 1 < len(steps)
                    else ts + scan_sec)
 
-        # ── 1. Check fills for all pending orders (TTL = this step) ──
+        # ── 1. Check fills for pending limit orders (TTL = this step) ──
         newly_active = []
         for p in pending_orders:
             c5m = raw_data.get(p["symbol"], {}).get("5m", [])
@@ -292,7 +349,7 @@ def run_config(
 
         concurrent_hist.append(len(active_trades))
 
-        # ── 3. Fill free basket slots with new pending orders ────────
+        # ── 3. Fill free basket slots ────────────────────────────────
         slots_free = basket_size - len(active_trades)
         if slots_free <= 0:
             continue
@@ -320,47 +377,50 @@ def run_config(
             setup["mps"]      = st.manual_pick_score(setup)
             setup["category"] = st.classify(setup)
             setup["model"]    = st.recommend_model(setup)
-            if setup["category"] in allowed:
-                setups.append(setup)
+            if setup["category"] not in allowed:
+                continue
+            if use_core and not _passes_core_v93(setup):
+                continue
+            setups.append(setup)
 
         setups.sort(key=_rank_key, reverse=True)
         candidates = setups[:min(top_n, slots_free)]
 
         for top in candidates:
-            pending_orders.append({
-                "symbol":      top["symbol"],
-                "direction":   top["direction"],
-                "entry":       top["entry_mid"],
-                "entry_mid":   top["entry_mid"],
-                "sl":          top["sl"],
-                "tp1a":        top["tp1a"],
-                "tp1b":        top["tp1b"],
-                "tp2":         top["tp2"],
-                "tp3":         top["tp3"],
-                "rr":          top["rr"],
-                "risk":        top["risk"],
-                "mps":         top["mps"],
-                "ts_score":    top["ts"],
-                "category":    top["category"],
-                "model":       top["model"],
-                "wyckoff":     top["wyckoff"]["pattern"],
-                "status":      top["status"],
-                "macd_5m":     top.get("macd_5m", "none"),
-                "choch_age":   top["choch_age"],
-                "entry_ext":   top["entry_ext"],
-                "signal_time": step_dt.strftime("%Y-%m-%d %H:%M"),
-                "signal_ts":   ts,
-                "ttl_ts":      next_ts,
-                "result":      "pending",
-                "pnl_r":       None,
-                "_setup":      top,
-            })
+            rec = _trade_record(top, step_dt, ts, next_ts, entry_mode)
             orders["created"] += 1
 
-    # End of period — close any still-running trades
+            if market_mode:
+                # Immediate fill at entry_mid (signal candle close)
+                orders["filled"] += 1
+                rec["entry_ts"]   = ts
+                rec["entry_time"] = step_dt.strftime("%Y-%m-%d %H:%M")
+                active_trades.append(rec)
+            else:
+                pending_orders.append(rec)
+
+    # End of period — close still-running trades at last 5m close (close_at_end)
+    end_ts = int(end_dt.timestamp())
     for t in active_trades:
-        t["exit_reason"] = "open_at_end"
-        t["pnl_r"]       = None
+        c5m_all = raw_data.get(t["symbol"], {}).get("5m", [])
+        pnl_r = None
+        exit_reason = "open_at_end"
+        if isinstance(c5m_all, list):
+            last_sliced = slice_at(c5m_all, end_ts)
+            if last_sliced and t.get("entry_ts"):
+                after = [c for c in last_sliced if c["time"] > t["entry_ts"]]
+                if after:
+                    last_price = after[-1]["close"]
+                    entry = t["entry"]
+                    risk = abs(entry - t["sl"]) if t.get("sl") else 0
+                    if risk > 0:
+                        if t["direction"] == "LONG":
+                            pnl_r = round((last_price - entry) / risk, 4)
+                        else:
+                            pnl_r = round((entry - last_price) / risk, 4)
+                        exit_reason = "close_at_end"
+        t["exit_reason"] = exit_reason
+        t["pnl_r"]       = pnl_r
         t["exit_time"]   = end_dt.strftime("%Y-%m-%d %H:%M")
         trades.append(t)
 
@@ -374,7 +434,7 @@ def run_config(
 # ============================================================
 
 def compute_stats(trades, concurrent_hist=None, orders=None):
-    closed = [t for t in trades if t.get("exit_reason") not in ("open", "open_at_end", None)]
+    closed = [t for t in trades if t.get("exit_reason") not in ("open", "open_at_end", None) and t.get("pnl_r") is not None]
     if not closed:
         return {}
 
@@ -418,6 +478,13 @@ def compute_stats(trades, concurrent_hist=None, orders=None):
     else:
         z_score = 0.0
 
+    avg_win_r  = sum(t["pnl_r"] for t in positive_wins) / len(positive_wins) if positive_wins else 0.0
+    avg_loss_r = sum(t["pnl_r"] for t in losses)        / len(losses)        if losses        else 0.0
+    payoff_ratio  = avg_win_r / abs(avg_loss_r) if avg_loss_r < 0 else None
+    breakeven_wr  = round(1 / (1 + payoff_ratio) * 100, 1) if payoff_ratio else None
+    win_rate_dec  = len(positive_wins) / len(closed) if closed else 0.0
+    expectancy    = win_rate_dec * avg_win_r + (1 - win_rate_dec) * avg_loss_r
+
     stats = {
         "total":          len(closed),
         "positive_wins":  len(positive_wins),
@@ -425,12 +492,15 @@ def compute_stats(trades, concurrent_hist=None, orders=None):
         "partial_wins":   len(wins_be),
         "losses":         len(losses),
         "no_exit":        len(no_exit),
-        "win_rate":       len(positive_wins) / len(closed) * 100 if closed else 0,
+        "win_rate":       win_rate_dec * 100,
         "total_r":        round(total_r, 3),
         "ev_per_trade":   round(ev, 3),
         "profit_factor":  round(pf, 3) if pf else None,
-        "avg_win_r":      round(sum(t["pnl_r"] for t in positive_wins) / len(positive_wins), 3) if positive_wins else 0,
-        "avg_loss_r":     round(sum(t["pnl_r"] for t in losses)        / len(losses),        3) if losses        else 0,
+        "avg_win_r":      round(avg_win_r,  3),
+        "avg_loss_r":     round(avg_loss_r, 3),
+        "payoff_ratio":   round(payoff_ratio, 3) if payoff_ratio else None,
+        "breakeven_wr":   breakeven_wr,
+        "expectancy":     round(expectancy, 3),
         "avg_mfe_r":      round(avg_mfe, 3),
         "avg_mae_r":      round(avg_mae, 3),
         "max_dd_r":       round(max_dd, 3),
@@ -461,23 +531,58 @@ def compute_stats(trades, concurrent_hist=None, orders=None):
 def _breakdown(trades, key_fn):
     groups: dict = {}
     for t in trades:
-        if t.get("exit_reason") in ("open", "open_at_end", None):
+        if t.get("exit_reason") in ("open", "open_at_end", None) or t.get("pnl_r") is None:
             continue
         k = key_fn(t)
         groups.setdefault(k, []).append(t)
     rows = []
     for k, ts in sorted(groups.items(), key=lambda x: -len(x[1])):
-        pnls = [t["pnl_r"] for t in ts if t.get("pnl_r") is not None]
-        wins = sum(1 for p in pnls if p > 0)
+        pnls  = [t["pnl_r"] for t in ts if t.get("pnl_r") is not None]
+        wins  = [p for p in pnls if p > 0]
+        losss = [p for p in pnls if p < 0]
+        n     = len(ts)
+        wr    = len(wins) / n * 100 if n else 0
+        ev    = sum(pnls) / n if n and pnls else 0
+        gw    = sum(wins)
+        gl    = abs(sum(losss))
+        pf    = gw / gl if gl > 0 else None
+        aw    = sum(wins) / len(wins)   if wins  else 0.0
+        al    = sum(losss) / len(losss) if losss else 0.0
+        po    = aw / abs(al) if al < 0 else None
         rows.append({
-            "label":   str(k),
-            "n":       len(ts),
-            "wins":    wins,
-            "wr":      f"{wins/len(ts)*100:.0f}%" if ts else "—",
-            "total_r": f"{sum(pnls):+.2f}R" if pnls else "—",
-            "ev":      f"{sum(pnls)/len(ts):+.2f}R" if ts and pnls else "—",
+            "label":         str(k),
+            "n":             n,
+            "wins":          len(wins),
+            "wr":            f"{wr:.0f}%",
+            "total_r":       f"{sum(pnls):+.2f}R" if pnls else "—",
+            "ev":            f"{ev:+.3f}R",
+            "pf":            f"{pf:.2f}" if pf else "—",
+            "avg_win":       f"+{aw:.3f}R" if wins  else "—",
+            "avg_loss":      f"{al:.3f}R"  if losss else "—",
+            "payoff":        f"{po:.2f}"   if po    else "—",
+            # raw values for edge filtering
+            "_ev":           ev,
+            "_pf":           pf or 0.0,
+            "_n":            n,
         })
     return rows
+
+
+def _edge_groups(all_breakdowns):
+    """Flatten all breakdown rows and return (candidates, killers)."""
+    candidates, killers = [], []
+    for label, rows in all_breakdowns:
+        for r in rows:
+            if r["_n"] < 20:
+                continue
+            entry = {"group": label, **r}
+            if r["_ev"] > 0 and r["_pf"] > 1.2:
+                candidates.append(entry)
+            elif r["_ev"] < 0 and r["_pf"] < 1.0:
+                killers.append(entry)
+    candidates.sort(key=lambda x: -x["_ev"])
+    killers.sort(key=lambda x: x["_ev"])
+    return candidates, killers
 
 # ============================================================
 # HTML REPORT HELPERS
@@ -526,41 +631,80 @@ def _equity_svg(equity, width=700, height=120):
 def _breakdown_table(rows, title):
     if not rows:
         return ""
-    th = "".join(f'<th>{h}</th>' for h in ["Group", "N", "Wins", "WR", "Total R", "EV/trade"])
+    headers = ["Group", "N", "Wins", "WR", "Total R", "EV/trade", "PF", "Avg Win", "Avg Loss", "Payoff"]
+    th = "".join(f'<th>{h}</th>' for h in headers)
     tr_html = "".join(
-        f'<tr><td>{r["label"]}</td><td>{r["n"]}</td><td>{r["wins"]}</td>'
+        f'<tr>'
+        f'<td>{r["label"]}</td><td>{r["n"]}</td><td>{r["wins"]}</td>'
         f'<td>{r["wr"]}</td>'
         f'<td style="color:{("#00ff8c" if r["total_r"].startswith("+") else "#ff4d4d")}">{r["total_r"]}</td>'
-        f'<td>{r["ev"]}</td></tr>'
+        f'<td style="color:{("#00ff8c" if r["_ev"]>0 else "#ff4d4d")}">{r["ev"]}</td>'
+        f'<td>{r["pf"]}</td>'
+        f'<td style="color:#00ff8c">{r["avg_win"]}</td>'
+        f'<td style="color:#ff4d4d">{r["avg_loss"]}</td>'
+        f'<td>{r["payoff"]}</td>'
+        f'</tr>'
         for r in rows
     )
     return (
         f'<h3 style="margin:16px 0 8px;color:#8899aa;font-size:12px;'
         f'letter-spacing:1px;text-transform:uppercase">{title}</h3>'
+        f'<div style="overflow-x:auto">'
         f'<table style="width:auto;border-collapse:collapse;font-size:12px;margin-bottom:16px">'
-        f'<thead><tr>{th}</tr></thead><tbody>{tr_html}</tbody></table>'
+        f'<thead><tr>{th}</tr></thead><tbody>{tr_html}</tbody></table></div>'
+    )
+
+
+def _edge_table(groups, accent):
+    if not groups:
+        return f'<div style="color:#556677;font-size:12px">Brak grup (min 20 trade\'ów).</div>'
+    headers = ["Group", "Dimension", "N", "WR", "EV/trade", "PF", "Avg Win", "Avg Loss", "Payoff"]
+    th = "".join(f'<th>{h}</th>' for h in headers)
+    rows = "".join(
+        f'<tr>'
+        f'<td style="color:{accent};font-weight:bold">{g["label"]}</td>'
+        f'<td style="color:#8899aa">{g["group"]}</td>'
+        f'<td>{g["n"]}</td>'
+        f'<td>{g["wr"]}</td>'
+        f'<td style="color:{accent}">{g["ev"]}</td>'
+        f'<td>{g["pf"]}</td>'
+        f'<td style="color:#00ff8c">{g["avg_win"]}</td>'
+        f'<td style="color:#ff4d4d">{g["avg_loss"]}</td>'
+        f'<td>{g["payoff"]}</td>'
+        f'</tr>'
+        for g in groups
+    )
+    return (
+        f'<div style="overflow-x:auto">'
+        f'<table style="width:100%;border-collapse:collapse;font-size:12px">'
+        f'<thead><tr>{th}</tr></thead><tbody>{rows}</tbody></table></div>'
     )
 
 
 def _config_comparison_table(config_results, scan_interval_h):
     rows_html = ""
-    for (cfg, model, cons_label), (trades, stats) in sorted(config_results.items()):
+    for (cfg, model, cons_label, entry_mode), (trades, stats) in sorted(config_results.items()):
         if not stats:
             continue
-        tr_col = "#00ff8c" if (stats.get("total_r") or 0) > 0 else "#ff4d4d"
-        wr_col = "#00ff8c" if stats.get("win_rate", 0) >= 50 else "#ff4d4d"
-        pf     = stats.get("profit_factor")
-        fr     = stats.get("fill_rate", 0)
-        cons_c = "#88ccff" if cons_label == "conservative" else "#ffd700"
+        tr_col  = "#00ff8c" if (stats.get("total_r") or 0) > 0 else "#ff4d4d"
+        wr_col  = "#00ff8c" if stats.get("win_rate", 0) >= 50 else "#ff4d4d"
+        pf      = stats.get("profit_factor")
+        fr      = stats.get("fill_rate", 0)
+        cons_c  = "#88ccff" if cons_label == "conservative" else "#ffd700"
+        em_c    = "#00ff8c" if entry_mode == "immediate" else "#aabbcc"
+        exp_v   = stats.get("expectancy", 0)
+        exp_c   = "#00ff8c" if exp_v > 0 else "#ff4d4d"
         rows_html += (
             f'<tr>'
             f'<td style="font-weight:bold">{cfg}</td>'
             f'<td>{model}</td>'
             f'<td style="color:{cons_c}">{cons_label}</td>'
+            f'<td style="color:{em_c}">{entry_mode}</td>'
             f'<td>{CONFIGS[cfg]["basket_size"]}</td>'
             f'<td>{stats.get("total", 0)}</td>'
             f'<td style="color:{wr_col}">{stats.get("win_rate", 0):.1f}%</td>'
             f'<td style="color:{tr_col}">{stats.get("total_r", 0):+.3f}R</td>'
+            f'<td style="color:{exp_c}">{exp_v:+.3f}R</td>'
             f'<td>{stats.get("ev_per_trade", 0):+.3f}R</td>'
             f'<td>{f"{pf:.2f}" if pf else "—"}</td>'
             f'<td>-{stats.get("max_dd_r", 0):.2f}R</td>'
@@ -568,15 +712,16 @@ def _config_comparison_table(config_results, scan_interval_h):
             f'<td>{fr:.1f}%</td>'
             f'</tr>'
         )
-    headers = ["Config", "Model", "Intrabar", "Basket",
-               "Trades", "Win Rate", "Total R", "EV/Trade",
+    headers = ["Config", "Model", "Intrabar", "Entry", "Basket",
+               "Trades", "Win Rate", "Total R", "Expectancy", "EV/Trade",
                "PF", "Max DD", "Z-Score", "Fill Rate"]
     th_html = "".join(f'<th>{h}</th>' for h in headers)
     ttl_note = (
         f'<p style="font-size:11px;color:#556677;margin-bottom:12px">'
-        f'⚠ Limit order TTL = {scan_interval_h}h (one scan interval). '
-        f'Orders not filled before the next scan are cancelled. '
-        f'Fill Rate = filled / created pending orders.</p>'
+        f'⚠ Limit order TTL = {scan_interval_h}h. '
+        f'Immediate entry = instant fill at entry_mid. '
+        f'close_at_end = open trades closed at last 5m candle price. '
+        f'Fill Rate = filled / created (limit mode only).</p>'
     )
     return (
         f'<h2 style="border-bottom:1px solid #1e2d40;padding-bottom:8px;margin-bottom:8px">'
@@ -678,25 +823,39 @@ def generate_report(config_results, meta):
         f'conservative mode: SL wins intrabar conflict. '
         f'optimistic mode: TP wins intrabar conflict. '
         f'★ in trade log = conservative intrabar triggered.</div>'
+        f'<div style="margin-top:8px;font-size:11px;background:#0a1525;border-left:3px solid '
+        f'{"#00ff8c" if meta["fuel_label"] == "fuel_ON" else "#ff4d4d"}'
+        f';padding:6px 10px;display:inline-block">'
+        f'Target Feasibility Filter: '
+        f'<strong style="color:{"#00ff8c" if meta["fuel_label"] == "fuel_ON" else "#ff4d4d"}">'
+        f'{"ON — TFS affects classify(), MPS ranking (v9.3)" if meta["fuel_label"] == "fuel_ON" else "OFF — TFS diagnostic only, no effect on classify() or MPS (baseline v9.1)"}'
+        f'</strong></div>'
         f'</div>'
     )
 
     comparison = _config_comparison_table(config_results, meta["scan_interval_h"])
 
+    # Collect all breakdowns for edge diagnostics (across all runs)
+    all_breakdowns_global = []
+
     sections = ""
-    for (cfg, model, cons_label), (trades, stats) in sorted(config_results.items()):
+    for (cfg, model, cons_label, entry_mode), (trades, stats) in sorted(config_results.items()):
         if not stats:
             continue
 
         basket_size = CONFIGS[cfg]["basket_size"]
-        eq   = stats.get("equity", [0])
-        wr   = stats.get("win_rate", 0)
-        tr   = stats.get("total_r", 0)
-        wr_c = "#00ff8c" if wr >= 50 else "#ff4d4d"
-        tr_c = "#00ff8c" if tr > 0 else "#ff4d4d"
-        pf   = stats.get("profit_factor")
-        fr   = stats.get("fill_rate", 0)
+        eq     = stats.get("equity", [0])
+        wr     = stats.get("win_rate", 0)
+        tr     = stats.get("total_r", 0)
+        wr_c   = "#00ff8c" if wr >= 50 else "#ff4d4d"
+        tr_c   = "#00ff8c" if tr > 0 else "#ff4d4d"
+        pf     = stats.get("profit_factor")
+        fr     = stats.get("fill_rate", 0)
+        exp_v  = stats.get("expectancy", 0)
+        po     = stats.get("payoff_ratio")
+        bew    = stats.get("breakeven_wr")
         cons_c = "#88ccff" if cons_label == "conservative" else "#ffd700"
+        em_c   = "#00ff8c" if entry_mode == "immediate" else "#aabbcc"
 
         cards = (
             _stat_card("Trades",        stats.get("total", 0)) +
@@ -706,10 +865,16 @@ def generate_report(config_results, meta):
             _stat_card("Losses",        stats.get("losses",        0), "#ff4d4d") +
             _stat_card("Open/end",      stats.get("no_exit",       0), "#88ccff") +
             _stat_card("Win Rate",      f"{wr:.1f}%", wr_c) +
+            _stat_card("Breakeven WR",  f"{bew:.1f}%" if bew else "—") +
             _stat_card("Total R",       f"{tr:+.3f}R", tr_c) +
+            _stat_card("Expectancy",    f"{exp_v:+.3f}R",
+                       "#00ff8c" if exp_v > 0 else "#ff4d4d") +
             _stat_card("EV/Trade",      f'{stats.get("ev_per_trade", 0):+.3f}R') +
             _stat_card("Profit Factor", f'{pf:.2f}' if pf else "—",
                        "#00ff8c" if pf and pf > 1 else "#ff4d4d") +
+            _stat_card("Avg Win",       f'+{stats.get("avg_win_r",  0):.3f}R', "#00ff8c") +
+            _stat_card("Avg Loss",      f'{stats.get("avg_loss_r",  0):.3f}R', "#ff4d4d") +
+            _stat_card("Payoff Ratio",  f'{po:.2f}' if po else "—") +
             _stat_card("Max DD",        f'-{stats.get("max_dd_r", 0):.2f}R', "#ff8844") +
             _stat_card("Avg MFE",       f'+{stats.get("avg_mfe_r", 0):.2f}R', "#88ccff") +
             _stat_card("Avg MAE",       f'{stats.get("avg_mae_r", 0):.2f}R',  "#ff8844") +
@@ -733,31 +898,59 @@ def generate_report(config_results, meta):
                 _stat_card("Steps 3 active", dist.get(3, 0))
             )
 
-        bd_cat   = _breakdown(trades, lambda t: t.get("category",  "?"))
-        bd_macd  = _breakdown(trades, lambda t: t.get("macd_5m",   "?"))
-        bd_dir   = _breakdown(trades, lambda t: t.get("direction",  "?"))
-        bd_choch = _breakdown(trades, lambda t: str(t.get("choch_age", "?")))
-        bd_ext   = _breakdown(
-            trades,
-            lambda t: (f'{int(t.get("entry_ext", 0) / 0.1) * 10}–'
-                       f'{int(t.get("entry_ext", 0) / 0.1) * 10 + 10}%')
-        )
+        bd_cat    = _breakdown(trades, lambda t: t.get("category",  "?"))
+        bd_status = _breakdown(trades, lambda t: t.get("status",    "?"))
+        bd_macd   = _breakdown(trades, lambda t: t.get("macd_5m",   "?"))
+        bd_dir    = _breakdown(trades, lambda t: t.get("direction",  "?"))
+        bd_choch  = _breakdown(trades, lambda t: (
+            "0–1" if (t.get("choch_age") or 99) <= 1 else
+            "2"   if (t.get("choch_age") or 99) == 2 else
+            "3"   if (t.get("choch_age") or 99) == 3 else "4+"
+        ))
+        bd_ext    = _breakdown(trades, lambda t: (
+            "≤10%"    if (t.get("entry_ext") or 0) <= 0.10 else
+            "10–25%"  if (t.get("entry_ext") or 0) <= 0.25 else
+            "25–50%"  if (t.get("entry_ext") or 0) <= 0.50 else ">50%"
+        ))
+        bd_entry  = _breakdown(trades, lambda t: t.get("entry_mode", "limit"))
+        bd_tfs    = _breakdown(trades, lambda t: (
+            "<40"   if (t.get("target_feasibility_score") or 0) < 40  else
+            "40–54" if (t.get("target_feasibility_score") or 0) < 55  else
+            "55–69" if (t.get("target_feasibility_score") or 0) < 70  else
+            "70–84" if (t.get("target_feasibility_score") or 0) < 85  else "85+"
+        ))
+        bd_verdict = _breakdown(trades, lambda t: t.get("verdict", "?"))
 
         bds_html = (
-            _breakdown_table(bd_cat,   "By Category") +
-            _breakdown_table(bd_macd,  "By MACD") +
-            _breakdown_table(bd_dir,   "Long vs Short") +
-            _breakdown_table(bd_choch, "By ChoCH Age") +
-            _breakdown_table(bd_ext,   "By Entry Extension")
+            _breakdown_table(bd_cat,     "By Category") +
+            _breakdown_table(bd_status,  "By Status") +
+            _breakdown_table(bd_macd,    "By MACD") +
+            _breakdown_table(bd_dir,     "Long vs Short") +
+            _breakdown_table(bd_choch,   "By ChoCH Age") +
+            _breakdown_table(bd_ext,     "By Entry Extension") +
+            _breakdown_table(bd_entry,   "By Entry Mode") +
+            _breakdown_table(bd_tfs,     "By Target Feasibility Score") +
+            _breakdown_table(bd_verdict, "By TFS Verdict")
         )
 
-        label = f"{cfg} / Model {model} / {cons_label}"
+        # Accumulate for global edge section
+        run_tag = f"{cfg}/{model}/{cons_label}/{entry_mode}"
+        for dim_label, rows in [
+            ("Category", bd_cat), ("Status", bd_status), ("MACD", bd_macd),
+            ("Direction", bd_dir), ("ChoCH", bd_choch), ("ExtBucket", bd_ext),
+            ("EntryMode", bd_entry), ("TFS bucket", bd_tfs), ("TFS verdict", bd_verdict),
+        ]:
+            for r in rows:
+                all_breakdowns_global.append((f"{run_tag} · {dim_label}", [r]))
+
+        label = f"{cfg} / Model {model} / {cons_label} / {entry_mode}"
         basket_tag = "  (basket 3)" if basket_size > 1 else ""
         sections += (
             f'<div style="border-top:2px solid #1e2d40;margin:32px 0 0;padding:24px 32px 0">'
             f'<h2 style="color:#e6edf7;margin-bottom:4px">{label}{basket_tag}</h2>'
-            f'<div style="font-size:11px;color:{cons_c};margin-bottom:16px">'
-            f'intrabar conflict → {"SL wins" if cons_label == "conservative" else "TP wins"}</div>'
+            f'<div style="font-size:11px;margin-bottom:4px">'
+            f'<span style="color:{cons_c}">intrabar → {"SL wins" if cons_label == "conservative" else "TP wins"}</span>'
+            f'  |  <span style="color:{em_c}">entry → {entry_mode}</span></div>'
             f'<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));'
             f'gap:8px;margin-bottom:20px">{cards}</div>'
             f'<div style="margin-bottom:16px">{_equity_svg(eq)}</div>'
@@ -765,6 +958,26 @@ def generate_report(config_results, meta):
             f'{_trade_log_table(trades, label)}'
             f'</div>'
         )
+
+    # ── Global Edge Diagnostics ──────────────────────────────────
+    candidates, killers = _edge_groups(all_breakdowns_global)
+    edge_section = (
+        f'<div style="border-top:2px solid #ffd700;margin:32px 0 0;padding:24px 32px 0">'
+        f'<h2 style="color:#ffd700;margin-bottom:16px">🔬 Edge Diagnostics</h2>'
+        f'<p style="font-size:11px;color:#556677;margin-bottom:20px">'
+        f'Grupuje wszystkie wymiary (status, MACD, direction, ChoCH, entry_ext) we wszystkich konfiguracjach. '
+        f'Minimalna próbka: 20 trade\'ów.</p>'
+        f'<h3 style="color:#00ff8c;margin-bottom:8px">✅ EDGE CANDIDATES '
+        f'<span style="font-size:11px;font-weight:normal;color:#556677">'
+        f'(N≥20, EV>0, PF>1.2)</span></h3>'
+        f'{_edge_table(candidates, "#00ff8c")}'
+        f'<h3 style="color:#ff4d4d;margin:20px 0 8px">❌ EDGE KILLERS '
+        f'<span style="font-size:11px;font-weight:normal;color:#556677">'
+        f'(N≥20, EV&lt;0, PF&lt;1.0)</span></h3>'
+        f'{_edge_table(killers, "#ff4d4d")}'
+        f'</div>'
+    )
+    sections += edge_section
 
     footer = (
         f'<div style="background:#0a0f1a;border-top:1px solid #1e2d40;'
@@ -789,11 +1002,20 @@ def generate_report(config_results, meta):
 # ============================================================
 
 def main():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--fuel-filter", choices=["on", "off"], default="on",
+                        help="Enable/disable Target Feasibility Filter in classify()")
+    args, _ = parser.parse_known_args()
+
+    st.USE_TARGET_FEASIBILITY_FILTER = (args.fuel_filter == "on")
+    fuel_label = "fuel_ON" if st.USE_TARGET_FEASIBILITY_FILTER else "fuel_OFF"
+
     print("=" * 60)
     print("  Backtest v9.1 strict")
     print("  Configs: TOP1 / TOP3 / PREMIUM / HQ / PREMIUM_HQ")
     print("  Models:  A / B / Auto")
     print("  Modes:   conservative / optimistic")
+    print(f"  Fuel Filter (TFS): {'ON' if st.USE_TARGET_FEASIBILITY_FILTER else 'OFF'}")
     print("=" * 60)
 
     start_str = input("\nData START (dd/mm/yyyy hh:mm): ").strip()
@@ -816,13 +1038,13 @@ def main():
     n_sym     = int(n_sym_str) if n_sym_str.isdigit() else 50
 
     print(f"\nKonfiguracje: {', '.join(CONFIGS)}")
-    cfg_input = input("Które konfiguracje? (Enter = wszystkie, np. TOP1,TOP3): ").strip()
+    cfg_input = input("Które konfiguracje? (Enter = wszystkie, np. TOP1,CORE_V93): ").strip()
     chosen_cfgs = (
         [c.strip() for c in cfg_input.split(",") if c.strip() in CONFIGS]
         if cfg_input else list(CONFIGS)
     )
 
-    print("Modele: A, B, Auto")
+    print("Modele: A, B, Auto, FIXED_2R, FIXED_1_5R, FIXED_3R")
     mdl_input = input("Które modele? (Enter = wszystkie): ").strip()
     chosen_models = (
         [m.strip() for m in mdl_input.split(",") if m.strip() in MODELS]
@@ -838,6 +1060,15 @@ def main():
     else:
         chosen_cons = [("conservative", True)]
 
+    print("Tryb wejścia: l = limit  i = immediate  li = oba")
+    entry_input = input("Entry (Enter = limit): ").strip().lower()
+    if entry_input in ("i", "immediate"):
+        chosen_entries = ["immediate"]
+    elif entry_input in ("li", "oba", "both"):
+        chosen_entries = ["limit", "immediate"]
+    else:
+        chosen_entries = ["limit"]
+
     start_ms = int(start_dt.timestamp() * 1000)
     end_ms   = int(end_dt.timestamp()   * 1000)
 
@@ -846,6 +1077,7 @@ def main():
     print(f"Konfiguracje: {chosen_cfgs}")
     print(f"Modele:       {chosen_models}")
     print(f"Tryby:        {[c for c, _ in chosen_cons]}")
+    print(f"Entry:        {chosen_entries}")
 
     print("\n[1/3] Pobieranie listy top symboli...")
     top_crypto = st.get_top_crypto(n_sym)
@@ -870,37 +1102,39 @@ def main():
     for sym in raw_data:
         raw_data[sym]["_turnover"] = turnover_map.get(sym, 999_999_999)
 
-    n_runs = len(chosen_cfgs) * len(chosen_models) * len(chosen_cons)
+    n_runs = len(chosen_cfgs) * len(chosen_models) * len(chosen_cons) * len(chosen_entries)
     print(f"\n[3/3] Symulacja — {n_runs} przebiegów...")
     config_results = {}
 
     for cfg_name in chosen_cfgs:
         for model_name in chosen_models:
             for cons_label, cons_val in chosen_cons:
-                basket = CONFIGS[cfg_name]["basket_size"]
-                label  = f"{cfg_name}/{model_name}/{cons_label}"
-                print(f"  → {label} (basket={basket}) ...", end="", flush=True)
+                for entry_mode in chosen_entries:
+                    basket = CONFIGS[cfg_name]["basket_size"]
+                    label  = f"{cfg_name}/{model_name}/{cons_label}/{entry_mode}"
+                    print(f"  → {label} (basket={basket}) ...", end="", flush=True)
 
-                trades, orders, concurrent_hist = run_config(
-                    raw_data, symbols, start_dt, end_dt, scan_h,
-                    cfg_name, model_name, cons_val,
-                )
-                stats = compute_stats(
-                    trades,
-                    concurrent_hist if basket > 1 else None,
-                    orders,
-                )
-                stats["basket_size"] = basket
-                config_results[(cfg_name, model_name, cons_label)] = (trades, stats)
+                    trades, orders, concurrent_hist = run_config(
+                        raw_data, symbols, start_dt, end_dt, scan_h,
+                        cfg_name, model_name, cons_val, entry_mode,
+                    )
+                    stats = compute_stats(
+                        trades,
+                        concurrent_hist if basket > 1 else None,
+                        orders,
+                    )
+                    stats["basket_size"] = basket
+                    config_results[(cfg_name, model_name, cons_label, entry_mode)] = (trades, stats)
 
-                fr = stats.get("fill_rate", 0)
-                tr = stats.get("total_r", "—")
-                wr = stats.get("win_rate", 0)
-                print(
-                    f"  {stats.get('total',0)} trades | "
-                    f"WR={wr:.1f}% | R={tr} | "
-                    f"fill={fr:.0f}% ({orders['filled']}/{orders['created']})"
-                )
+                    fr = stats.get("fill_rate", 0)
+                    tr = stats.get("total_r", "—")
+                    wr = stats.get("win_rate", 0)
+                    ev = stats.get("expectancy", 0)
+                    print(
+                        f"  {stats.get('total',0)} trades | "
+                        f"WR={wr:.1f}% | R={tr} | EV={ev:+.3f}R | "
+                        f"fill={fr:.0f}% ({orders['filled']}/{orders['created']})"
+                    )
 
     report_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     meta = {
@@ -909,10 +1143,11 @@ def main():
         "scan_interval_h": scan_h,
         "n_symbols":       len(symbols),
         "report_time":     report_time,
+        "fuel_label":      fuel_label,
     }
 
     html    = generate_report(config_results, meta)
-    outfile = os.path.join(RESULTS_DIR, f"backtest_{start_tag}_{end_tag}.html")
+    outfile = os.path.join(RESULTS_DIR, f"backtest_{start_tag}_{end_tag}_{fuel_label}.html")
     with open(outfile, "w", encoding="utf-8") as f:
         f.write(html)
     print(f"\n✅ Raport: {outfile}")

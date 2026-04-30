@@ -7,3 +7,4 @@ research/results
 strategy_9_1/cache
 strategy_9_1/results
 *.pyc
+__pycache__

@@ -36,6 +36,9 @@ RATE_LIMIT_SEM   = threading.Semaphore(25)
 TIMEFRAMES       = ["1W", "1D", "4H", "1H", "30m", "15m", "5m", "1m"]
 BACKTEST_TIME_MS = None   # ustawiane przez scanner.py / backtest.py
 
+# Target Feasibility Filter — set False to disable TFS gates in classify()
+USE_TARGET_FEASIBILITY_FILTER = True
+
 # ============================================================
 # POBIERANIE DANYCH
 # ============================================================
@@ -400,6 +403,244 @@ def market_regime(btc_data, eth_data):
     return "chop"
 
 # ============================================================
+# TARGET FEASIBILITY HELPERS
+# ============================================================
+
+def _compute_atr(candles, period=14):
+    if len(candles) < period + 1:
+        return None
+    trs = []
+    for i in range(1, len(candles)):
+        h, l, pc = candles[i]["high"], candles[i]["low"], candles[i-1]["close"]
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+    if len(trs) < period:
+        return None
+    return sum(trs[-period:]) / period
+
+
+def _poc_simple(candles, n_buckets=30):
+    """OHLCV-based point of control estimate."""
+    if not candles or len(candles) < 5:
+        return None
+    src  = candles[-100:] if len(candles) > 100 else candles
+    pmin = min(c["low"]  for c in src)
+    pmax = max(c["high"] for c in src)
+    if pmax == pmin:
+        return None
+    bsize   = (pmax - pmin) / n_buckets
+    profile = [0.0] * n_buckets
+    for c in src:
+        lo_b = max(0, min(n_buckets - 1, int((c["low"]  - pmin) / bsize)))
+        hi_b = max(0, min(n_buckets - 1, int((c["high"] - pmin) / bsize)))
+        span = hi_b - lo_b + 1
+        vpp  = c["volume"] / span
+        for b in range(lo_b, hi_b + 1):
+            profile[b] += vpp
+    poc_b = profile.index(max(profile))
+    return pmin + (poc_b + 0.5) * bsize
+
+
+def compute_target_feasibility(setup, candles_5m):
+    """
+    Scores how feasible it is that price will reach TP2 (3R).
+    Returns dict with target_feasibility_score 0-100 and sub-scores.
+    """
+    direction = setup["direction"]
+    entry     = setup["entry_mid"]
+    sl        = setup["sl"]
+    risk      = abs(entry - sl)
+    if risk == 0:
+        return {"target_feasibility_score": 0, "verdict": "NO FUEL",
+                "clean_path_score": 0, "liquidity_magnet_score": 0,
+                "poc_score": 0, "momentum_score": 0, "atr_capacity_score": 0,
+                "nearest_obstacle": None, "nearest_obstacle_r": None,
+                "nearest_magnet": None, "poc": None, "poc_position": "unknown",
+                "tp2_atr_ratio": None}
+
+    sign = 1 if direction == "LONG" else -1
+    tp1  = setup.get("tp1b") or (entry + sign * 2.0 * risk)
+    tp2  = setup.get("tp2")  or (entry + sign * 3.0 * risk)
+
+    # ── A) Clean path to target (0–25) ────────────────────────
+    src = candles_5m[-100:] if len(candles_5m) > 100 else candles_5m
+    sw_h, sw_l = swing_points(src, lb=4)
+
+    obstacles = []
+    if direction == "LONG":
+        for sh in sw_h:
+            p = sh["price"]
+            if entry < p < tp2:
+                obstacles.append(("swing high", p, (p - entry) / risk))
+        rh = setup["wyckoff"].get("range_high")
+        if rh and entry < rh < tp2:
+            obstacles.append(("range high", rh, (rh - entry) / risk))
+    else:
+        for sl_p in sw_l:
+            p = sl_p["price"]
+            if tp2 < p < entry:
+                obstacles.append(("swing low", p, (entry - p) / risk))
+        rl = setup["wyckoff"].get("range_low")
+        if rl and tp2 < rl < entry:
+            obstacles.append(("range low", rl, (entry - rl) / risk))
+
+    obstacles.sort(key=lambda x: x[2])
+    nearest_obstacle   = obstacles[0][0] if obstacles else None
+    nearest_obstacle_r = obstacles[0][2] if obstacles else None
+
+    if not obstacles:
+        clean_path_score = 25
+    elif obstacles[0][2] < 1.2:
+        clean_path_score = 0
+    elif obstacles[0][2] < 2.0:
+        clean_path_score = 10
+    elif obstacles[0][2] < 3.0:
+        clean_path_score = 18
+    else:
+        clean_path_score = 25
+
+    # ── B) Liquidity magnet quality (0–20) ────────────────────
+    nearest_magnet       = None
+    liquidity_magnet_score = 5  # default: mathematical target only
+    tol = 0.015
+
+    if direction == "LONG":
+        rh = setup["wyckoff"].get("range_high")
+        candidates = [(sh["price"], "swing high") for sh in sw_h if sh["price"] > entry]
+        if rh:
+            candidates.append((rh, "range high"))
+        for p, ltype in candidates:
+            dist = abs(p - tp2) / max(tp2, 0.0001)
+            if dist <= tol:
+                liquidity_magnet_score = 20
+                nearest_magnet = f"{ltype} @ {p:.4f}"
+                break
+            elif p > tp1 and liquidity_magnet_score < 15:
+                liquidity_magnet_score = 10
+                nearest_magnet = nearest_magnet or f"{ltype} @ {p:.4f}"
+    else:
+        rl = setup["wyckoff"].get("range_low")
+        candidates = [(sl_p["price"], "swing low") for sl_p in sw_l if sl_p["price"] < entry]
+        if rl:
+            candidates.append((rl, "range low"))
+        for p, ltype in sorted(candidates, reverse=True):
+            dist = abs(p - tp2) / max(tp2, 0.0001)
+            if dist <= tol:
+                liquidity_magnet_score = 20
+                nearest_magnet = f"{ltype} @ {p:.4f}"
+                break
+            elif p < tp1 and liquidity_magnet_score < 15:
+                liquidity_magnet_score = 10
+                nearest_magnet = nearest_magnet or f"{ltype} @ {p:.4f}"
+
+    # ── C) POC alignment (0–20) ───────────────────────────────
+    poc         = _poc_simple(candles_5m)
+    poc_score   = 12
+    poc_position = "unknown"
+
+    if poc:
+        if direction == "LONG":
+            if poc < sl:
+                poc_score, poc_position = 8,  "below SL"
+            elif sl <= poc <= entry:
+                poc_score, poc_position = 20, "support (SL–entry)"
+            elif entry < poc <= tp1:
+                poc_score, poc_position = 0,  "obstacle (entry–TP1)"
+            elif tp1 < poc <= tp2:
+                poc_score, poc_position = 5,  "mild obstacle (TP1–TP2)"
+            else:
+                poc_score, poc_position = 20, "magnet above TP2"
+        else:
+            if poc > sl:
+                poc_score, poc_position = 8,  "above SL"
+            elif entry <= poc <= sl:
+                poc_score, poc_position = 20, "resistance (entry–SL)"
+            elif tp1 <= poc < entry:
+                poc_score, poc_position = 0,  "obstacle (entry–TP1)"
+            elif tp2 <= poc < tp1:
+                poc_score, poc_position = 5,  "mild obstacle (TP1–TP2)"
+            else:
+                poc_score, poc_position = 20, "magnet below TP2"
+
+    # ── D) Momentum / displacement fuel (0–20) ────────────────
+    pc         = setup.get("pattern", {}).get("candle", {})
+    vol_bonus  = setup.get("vol_bonus", False)
+    avg_vol    = setup.get("avg_vol_5m", 0)
+    momentum_score = 8
+
+    if pc:
+        h, l, o, c, v = (pc.get("high",0), pc.get("low",0),
+                          pc.get("open",0), pc.get("close",0), pc.get("volume",0))
+        candle_range = h - l
+        body_size    = abs(c - o)
+        body_ratio   = body_size / candle_range if candle_range > 0 else 0
+
+        if direction == "LONG":
+            close_pos = (c - l) / candle_range if candle_range > 0 else 0
+        else:
+            close_pos = (h - c) / candle_range if candle_range > 0 else 0
+        strong_close = close_pos >= 0.65
+
+        recent   = candles_5m[-20:] if len(candles_5m) >= 20 else candles_5m
+        avg_body = (sum(abs(x["close"] - x["open"]) for x in recent) / len(recent)
+                    if recent else 0)
+        strong_body   = body_size > avg_body
+        strong_volume = vol_bonus or (avg_vol > 0 and v >= avg_vol * 1.2)
+
+        if strong_close and strong_body and strong_volume:
+            momentum_score = 20
+        elif strong_close and strong_body:
+            momentum_score = 15
+        elif strong_close or strong_body:
+            momentum_score = 12
+        # else stays 8
+
+    # ── E) ATR / volatility capacity (0–15) ───────────────────
+    atr_5m         = _compute_atr(candles_5m, 14)
+    atr_capacity_score = 10
+    tp2_atr_ratio  = None
+
+    if atr_5m and atr_5m > 0:
+        dist_to_tp2   = abs(tp2 - entry)
+        tp2_atr_ratio = dist_to_tp2 / atr_5m
+        if tp2_atr_ratio <= 4:
+            atr_capacity_score = 15
+        elif tp2_atr_ratio <= 7:
+            atr_capacity_score = 10
+        elif tp2_atr_ratio <= 10:
+            atr_capacity_score = 5
+        else:
+            atr_capacity_score = 0
+
+    # ── Total ─────────────────────────────────────────────────
+    tfs = max(0, min(100,
+        clean_path_score + liquidity_magnet_score + poc_score +
+        momentum_score   + atr_capacity_score
+    ))
+
+    if tfs >= 85:   verdict = "CLEAN PATH"
+    elif tfs >= 70: verdict = "TARGET POSSIBLE"
+    elif tfs >= 55: verdict = "TARGET DIFFICULT"
+    elif tfs >= 40: verdict = "TARGET BLOCKED"
+    else:           verdict = "NO FUEL"
+
+    return {
+        "target_feasibility_score": tfs,
+        "clean_path_score":         clean_path_score,
+        "liquidity_magnet_score":   liquidity_magnet_score,
+        "poc_score":                poc_score,
+        "momentum_score":           momentum_score,
+        "atr_capacity_score":       atr_capacity_score,
+        "nearest_obstacle":         nearest_obstacle,
+        "nearest_obstacle_r":       round(nearest_obstacle_r, 2) if nearest_obstacle_r else None,
+        "nearest_magnet":           nearest_magnet,
+        "poc":                      round(poc, 6) if poc else None,
+        "poc_position":             poc_position,
+        "tp2_atr_ratio":            round(tp2_atr_ratio, 1) if tp2_atr_ratio else None,
+        "verdict":                  verdict,
+    }
+
+
+# ============================================================
 # ANALIZA SYMBOLU
 # ============================================================
 
@@ -520,7 +761,7 @@ def analyze_symbol(symbol, data, regime):
     else:
         aligned = True if regime == "bearish" else (False if regime == "bullish" else None)
 
-    return {
+    setup = {
         "symbol":        symbol,
         "direction":     direction,
         "wyckoff":       wyckoff,
@@ -551,6 +792,8 @@ def analyze_symbol(symbol, data, regime):
         "price":         price,
         "turnover":      turnover,
     }
+    setup.update(compute_target_feasibility(setup, candles_5m))
+    return setup
 
 # ============================================================
 # SCORING
@@ -615,6 +858,7 @@ def manual_pick_score(s):
     ee  = s["entry_ext"]
     st  = s["status"]
     age = s["choch_age"]
+    tfs = s.get("target_feasibility_score", 50)
 
     if s["macd_5m"] == "yes":
         mps += 20 if "fvg" in st else (16 if "order_block" in st else 12)
@@ -632,6 +876,15 @@ def manual_pick_score(s):
 
     if s["aligned"] is True:   mps += 5
     elif s["aligned"] is False: mps -= 5
+
+    # Target feasibility component (0–20) — only when filter is active
+    if USE_TARGET_FEASIBILITY_FILTER:
+        if tfs >= 70:   mps += 20
+        elif tfs >= 55: mps += 12
+        elif tfs >= 40: mps += 5
+        # tfs < 55 → cap at 65
+        if tfs < 55:
+            mps = min(mps, 65)
 
     return min(max(mps, 0), 100)
 
@@ -654,16 +907,24 @@ def classify(s):
     }
     fvg_filled = bool(fvg and fvg.get("filled", False))
 
+    tfs = s.get("target_feasibility_score", 50)
+
     # Hard rejects
     if macd == "against":   return "rejected"
     if entry_ext > 0.50:    return "rejected"
     if rr < 2.0:            return "rejected"
     if fvg_filled:          return "rejected"
     if choch_age > 4:       return "rejected"
+    if USE_TARGET_FEASIBILITY_FILTER and tfs < 40:
+        return "rejected"
 
     # Below active score threshold
-    if ts < 73:
-        return "watchlist"
+    if USE_TARGET_FEASIBILITY_FILTER:
+        if ts < 73 or tfs < 55:
+            return "watchlist"
+    else:
+        if ts < 73:
+            return "watchlist"
 
     # Pin bar: only exceptional cases can be ACTIVE
     if is_pin_bar:

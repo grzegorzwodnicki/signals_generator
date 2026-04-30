@@ -17,9 +17,9 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 BACKTEST_TIME_MS = None
 
-TIMEFRAMES   = ["5m", "15m", "1H", "4H", "1D"]
-TF_LABEL     = {"5m": "5M", "15m": "15M", "1H": "1H", "4H": "4H", "1D": "1D"}
-TF_BYBIT     = {"5m": "5", "15m": "15", "1H": "60", "4H": "240", "1D": "D"}
+TIMEFRAMES   = ["5m", "15m", "30m", "1H", "4H", "1D"]
+TF_LABEL     = {"5m": "5M", "15m": "15M", "30m": "30M", "1H": "1H", "4H": "4H", "1D": "1D"}
+TF_BYBIT     = {"5m": "5",  "15m": "15",  "30m": "30",  "1H": "60", "4H": "240", "1D": "D"}
 
 # ============================================================
 # DATA FETCHING
@@ -60,8 +60,8 @@ def get_candles(symbol, interval, end_time_ms=None):
     b1 = _bybit_candles_raw(symbol, interval, 200, end_time_ms)
     if not b1:
         return []
-    last_ts = int(b1[-1][0]) - 1
-    b2 = _bybit_candles_raw(symbol, interval, 200, last_ts)
+    oldest_ts = min(int(c[0]) for c in b1)
+    b2 = _bybit_candles_raw(symbol, interval, 200, oldest_ts - 1)
     return _parse(b1 + b2)
 
 # ============================================================
@@ -441,6 +441,45 @@ def analyze_elliott(candles):
     return "Unclear"
 
 # ============================================================
+# DATA FRESHNESS
+# ============================================================
+
+def check_data_freshness(candles, tf_seconds):
+    if not candles:
+        return "NO_DATA"
+    last_ts = candles[-1]["time"]
+    now_ts  = int(time.time())
+    diff    = now_ts - last_ts
+    if diff > tf_seconds * 2:
+        return "STALE"
+    if diff > tf_seconds:
+        return "WARNING"
+    return "FRESH"
+
+# ============================================================
+# v9.1 READINESS
+# ============================================================
+
+def analyze_v91_readiness(data_by_tf):
+    htf = data_by_tf.get("1H", [])
+    mtf = data_by_tf.get("30m", [])
+    ltf = data_by_tf.get("5m", [])
+
+    if not htf or not mtf or not ltf:
+        return "NO_STRUCTURE"
+
+    wy = analyze_wyckoff(htf)
+    st = analyze_structure(ltf)
+
+    if wy.get("phase") == "D" and st.get("choch"):
+        return "READY_FOR_V9_1_SCAN"
+    if wy.get("phase") in ("C", "D"):
+        return "WATCH_ONLY"
+    if wy.get("ranging"):
+        return "CHOP"
+    return "NO_STRUCTURE"
+
+# ============================================================
 # HTML HELPERS
 # ============================================================
 
@@ -471,6 +510,22 @@ def _card(content, border="#1e2d40", bg="#101827"):
 # ============================================================
 
 def generate_report(symbol, data_by_tf, report_time, data_time, is_backtest):
+    freshness_5m = check_data_freshness(data_by_tf.get("5m", []), 300)
+    freshness_label = {
+        "FRESH":   "🟢 DATA FRESH",
+        "WARNING": "🟡 DATA SLIGHTLY DELAYED",
+        "STALE":   "🔴 DATA TOO OLD",
+        "NO_DATA": "❌ NO DATA",
+    }[freshness_5m]
+
+    v91_status = analyze_v91_readiness(data_by_tf)
+    v91_color  = {
+        "READY_FOR_V9_1_SCAN": "#00ff8c",
+        "WATCH_ONLY":           "#ffd700",
+        "CHOP":                 "#ff8844",
+        "NO_STRUCTURE":         "#8899aa",
+    }.get(v91_status, "#8899aa")
+
     # Run all analyses
     A = {}
     for tf in TIMEFRAMES:
@@ -735,6 +790,7 @@ def generate_report(symbol, data_by_tf, report_time, data_time, is_backtest):
     Report: <strong>{report_time}</strong> |
     Data: <strong>{data_time}</strong> |
     {"⚠ BACKTEST MODE" if is_backtest else "✅ LIVE DATA"} |
+    {freshness_label} |
     Timeframes: {" · ".join(TF_LABEL[tf] for tf in TIMEFRAMES if A.get(tf))}
   </div>
 </div>
@@ -764,6 +820,7 @@ def generate_report(symbol, data_by_tf, report_time, data_time, is_backtest):
 
 {_section("📦 Volume Profile / POC",
     f'<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px">{poc_cards or "<div style=\"color:#ff4d4d\">POC: UNKNOWN</div>"}</div>'
+    f'<div style="font-size:10px;color:#445566;margin-top:6px">POC is estimated from OHLCV candle ranges (not tick-level volume profile).</div>'
 )}
 
 {_section("〰️ Elliott Wave (Light)",
@@ -771,6 +828,12 @@ def generate_report(symbol, data_by_tf, report_time, data_time, is_backtest):
         (ell_rows or "<div style='color:#556677'>No data</div>") +
         "<div style='margin-top:8px;font-size:11px;color:#556677'>Optional light read — no full wave count. Only shown when obvious.</div>"
     )
+)}
+
+{_section("🧠 v9.1 Readiness",
+    f'<div style="font-size:20px;color:{v91_color};font-weight:bold">{v91_status}</div>'
+    f'<div style="margin-top:8px;font-size:12px;color:#8899aa">'
+    f'Assessment if instrument is ready for v9.1 scanner logic: Wyckoff + SMC alignment.</div>'
 )}
 
 {_section("🔍 Final Market Interpretation",

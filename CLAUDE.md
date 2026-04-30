@@ -25,8 +25,7 @@ python strategy_9_1/backtest.py
 Cache goes to `strategy_9_1/cache/`, results to `strategy_9_1/results/`.
 
 ### Legacy files (kept for reference)
-- **`signal_generator_9_1.py`** — original monolithic scanner (Approach A)
-- **`research/backtest.py`** — old backtest importing `signal_generator_9_1`
+- **`research/backtest.py`** — old backtest (was importing `signal_generator_9_1`, now orphaned)
 - **`fetch_and_zip_crypto.py`** + **`prompt_crypto_intradays_9_1.txt`** — Approach B: data fetch + LLM prompt workflow
 
 ## Environment setup

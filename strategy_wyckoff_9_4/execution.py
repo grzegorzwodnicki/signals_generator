@@ -1,5 +1,5 @@
 """
-execution.py — Trade simulation engine for strategy_9_1.
+execution.py — Trade simulation engine for strategy_wyckoff_9_4.
 
 simulate_model_a : 35% @ 1.1R, 35% @ 2.0R, 30% @ 3.0R  (max 1.985R)
 simulate_model_b : 50% @ 1.1R, 50% @ 2.0R               (max 1.55R)

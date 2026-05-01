@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-clean_output.py — usuwa pliki z output/, strategy_9_1/results/ i strategy_9_1/cache/.
+clean_output.py — usuwa pliki z output/, strategy_wyckoff_9_4/ i strategy_wyckoff_9_5/.
 
 Użycie:
   python clean_output.py           # usuwa wszystko
@@ -15,14 +15,18 @@ import glob
 _ROOT = os.path.dirname(os.path.abspath(__file__))
 
 TARGETS = [
-    {"dir": os.path.join(_ROOT, "output"),                    "patterns": ["*.html", "*.json", "*.zip"], "label": "output/"},
-    {"dir": os.path.join(_ROOT, "strategy_9_1", "results"),   "patterns": ["*.html"],                    "label": "strategy_9_1/results/"},
-    {"dir": os.path.join(_ROOT, "strategy_9_1", "cache"),     "patterns": ["*.json"],                    "label": "strategy_9_1/cache/"},
-    {"dir": os.path.join(_ROOT, "research", "cache"),         "patterns": ["*.json"],                    "label": "research/cache/"},
-    {"dir": os.path.join(_ROOT, "research", "output"),        "patterns": ["*.html", "*.json"],          "label": "research/output/"},
+    {"dir": os.path.join(_ROOT, "output"),                              "patterns": ["*.html", "*.json", "*.zip"], "label": "output/"},
+    {"dir": os.path.join(_ROOT, "strategy_wyckoff_9_4", "output"),     "patterns": ["*.html", "*.json", "*.zip"], "label": "strategy_wyckoff_9_4/output/"},
+    {"dir": os.path.join(_ROOT, "strategy_wyckoff_9_4", "results"),    "patterns": ["*.html"],                    "label": "strategy_wyckoff_9_4/results/"},
+    {"dir": os.path.join(_ROOT, "strategy_wyckoff_9_4", "cache"),      "patterns": ["*.json"],                    "label": "strategy_wyckoff_9_4/cache/"},
+    {"dir": os.path.join(_ROOT, "strategy_wyckoff_9_5", "output"),     "patterns": ["*.html", "*.json", "*.zip"], "label": "strategy_wyckoff_9_5/output/"},
+    {"dir": os.path.join(_ROOT, "strategy_wyckoff_9_5", "results"),    "patterns": ["*.html"],                    "label": "strategy_wyckoff_9_5/results/"},
+    {"dir": os.path.join(_ROOT, "strategy_wyckoff_9_5", "cache"),      "patterns": ["*.json"],                    "label": "strategy_wyckoff_9_5/cache/"},
+    {"dir": os.path.join(_ROOT, "research", "cache"),                   "patterns": ["*.json"],                    "label": "research/cache/"},
+    {"dir": os.path.join(_ROOT, "research", "output"),                  "patterns": ["*.html", "*.json"],          "label": "research/output/"},
 ]
 
-CACHE_ONLY_DIRS = {"strategy_9_1/cache/", "research/cache/"}
+CACHE_ONLY_DIRS = {"strategy_wyckoff_9_4/cache/", "strategy_wyckoff_9_5/cache/", "research/cache/"}
 
 
 def collect_files(cache_only=False):

@@ -106,8 +106,8 @@ def get_400_candles(symbol, interval, end_time_ms=None):
     b1 = _bybit_candles_raw(symbol, interval, 200, end_time_ms)
     if not b1:
         return []
-    last_ts = int(b1[-1][0]) - 1
-    b2 = _bybit_candles_raw(symbol, interval, 200, last_ts)
+    oldest_ts = min(int(c[0]) for c in b1)
+    b2 = _bybit_candles_raw(symbol, interval, 200, oldest_ts - 1)
     return _parse_candles(b1 + b2)
 
 def fetch_symbol_data(info):
@@ -440,6 +440,237 @@ def _poc_simple(candles, n_buckets=30):
     return pmin + (poc_b + 0.5) * bsize
 
 
+def calc_atr(candles, period=14):
+    """Public ATR helper (delegates to _compute_atr)."""
+    return _compute_atr(candles, period)
+
+
+def compute_wyckoff_cause(setup, data_by_tf):
+    """
+    Calculates Wyckoff Cause / Base Strength.
+    Score: range duration 0-4, compression 0-3, SOS/SOW displacement 0-4,
+           Phase D age 0-2, pullback hold 0-2. Total 0-15.
+    """
+    result = {
+        "wyckoff_cause_score":             0,
+        "base_strength_label":             "UNKNOWN_BASE",
+        "range_duration_bars_1h":          None,
+        "range_duration_hours":            None,
+        "range_width_percent":             None,
+        "range_atr_ratio":                 None,
+        "range_compression_score":         0,
+        "sos_sow_displacement_atr":        None,
+        "sos_sow_volume_ratio":            None,
+        "phase_d_age_bars":                None,
+        "pullback_depth_percent_of_range": None,
+        "pullback_hold_score":             0,
+        "wyckoff_cause_note":              "Wyckoff cause unavailable",
+    }
+
+    candles_1h = data_by_tf.get("1H") or data_by_tf.get("1h") or []
+    if not candles_1h or len(candles_1h) < 20:
+        return result
+
+    direction  = setup.get("direction")
+    wyckoff    = setup.get("wyckoff", {})
+    range_high = wyckoff.get("range_high")
+    range_low  = wyckoff.get("range_low")
+
+    if direction not in ("LONG", "SHORT"):
+        return result
+    if range_high is None or range_low is None or range_high <= range_low:
+        return result
+
+    range_height = range_high - range_low
+    mid_price    = (range_high + range_low) / 2
+    if mid_price <= 0:
+        return result
+
+    atr_1h = _compute_atr(candles_1h, 14)
+
+    # 1. Range width and compression
+    range_width_percent = (range_height / mid_price) * 100
+    result["range_width_percent"] = round(range_width_percent, 3)
+
+    if atr_1h and atr_1h > 0:
+        range_atr_ratio = range_height / atr_1h
+        result["range_atr_ratio"] = round(range_atr_ratio, 2)
+        if range_atr_ratio < 1.0:
+            range_compression_score = 1
+        elif range_atr_ratio <= 3.0:
+            range_compression_score = 3
+        elif range_atr_ratio <= 5.0:
+            range_compression_score = 2
+        else:
+            range_compression_score = 0
+    else:
+        range_atr_ratio = None
+        range_compression_score = 1
+    result["range_compression_score"] = range_compression_score
+
+    # 2. Range duration — count 1H candles with close inside range before breakout.
+    # Search only in the fresh tail (last 15 bars), matching detect_wyckoff() logic.
+    tail_start     = max(0, len(candles_1h) - 15)
+    breakout_index = None
+    for i in range(tail_start, len(candles_1h)):
+        close = candles_1h[i].get("close")
+        if close is None:
+            continue
+        if direction == "LONG" and close > range_high:
+            breakout_index = i
+            break
+        if direction == "SHORT" and close < range_low:
+            breakout_index = i
+            break
+
+    if breakout_index is None:
+        # No fresh breakout detected. Use recent candles only as approximation.
+        lookback = candles_1h[-80:]
+    else:
+        # Count candles inside range before the fresh SOS/SOW.
+        # breakout_index is searched only in the recent 15-bar tail,
+        # so this lookback estimates the duration of the current base,
+        # not an old historical breakout.
+        lookback = candles_1h[max(0, breakout_index - 120):breakout_index]
+
+    inside_count = sum(
+        1 for c in lookback
+        if c.get("close") is not None and range_low <= c["close"] <= range_high
+    )
+    result["range_duration_bars_1h"] = inside_count
+    result["range_duration_hours"]   = inside_count  # 1 bar = 1 hour
+
+    if inside_count < 8:
+        duration_score = 0
+    elif inside_count < 24:
+        duration_score = 1
+    elif inside_count <= 72:
+        duration_score = 3
+    elif inside_count <= 168:
+        duration_score = 4
+    else:
+        duration_score = 2
+
+    # 3. SOS/SOW displacement
+    displacement_score    = 0
+    sos_sow_displacement_atr = None
+    sos_sow_volume_ratio  = None
+    phase_d_age_bars      = None
+
+    if breakout_index is not None:
+        bo_c   = candles_1h[breakout_index]
+        bo_cls = bo_c.get("close")
+        if bo_cls is not None and atr_1h and atr_1h > 0:
+            disp = (max(0, bo_cls - range_high) if direction == "LONG"
+                    else max(0, range_low - bo_cls))
+            sos_sow_displacement_atr = round(disp / atr_1h, 3)
+            result["sos_sow_displacement_atr"] = sos_sow_displacement_atr
+            if sos_sow_displacement_atr < 0.3:
+                displacement_score = 0
+            elif sos_sow_displacement_atr < 0.8:
+                displacement_score = 1
+            elif sos_sow_displacement_atr <= 1.5:
+                displacement_score = 3
+            else:
+                displacement_score = 4
+
+        bo_vol = bo_c.get("volume")
+        prev_vols = [c.get("volume") for c in candles_1h[max(0, breakout_index - 20):breakout_index]
+                     if c.get("volume") is not None]
+        if bo_vol is not None and prev_vols:
+            avg_vol = sum(prev_vols) / len(prev_vols)
+            if avg_vol > 0:
+                sos_sow_volume_ratio = round(bo_vol / avg_vol, 2)
+                result["sos_sow_volume_ratio"] = sos_sow_volume_ratio
+                if sos_sow_volume_ratio >= 1.2 and displacement_score < 4:
+                    displacement_score += 1
+
+        phase_d_age_bars = max(0, len(candles_1h) - 1 - breakout_index)
+        result["phase_d_age_bars"] = phase_d_age_bars
+
+    # 4. Phase D age score
+    if phase_d_age_bars is None:
+        phase_d_age_score = 0
+    elif phase_d_age_bars <= 6:
+        phase_d_age_score = 2
+    elif phase_d_age_bars <= 24:
+        phase_d_age_score = 1
+    else:
+        phase_d_age_score = 0
+
+    # 5. Pullback depth and hold
+    pullback_hold_score   = 0
+    pullback_depth_pct    = None
+    recent_after_breakout = candles_1h[breakout_index:] if breakout_index is not None else []
+
+    if recent_after_breakout:
+        if direction == "LONG":
+            pb_low  = min((c["low"] for c in recent_after_breakout if c.get("low") is not None),
+                          default=None)
+            if pb_low is not None:
+                pullback_depth_pct = round(((range_high - pb_low) / range_height) * 100, 1)
+                pd = (range_high - pb_low) / range_height
+        else:
+            pb_high = max((c["high"] for c in recent_after_breakout if c.get("high") is not None),
+                          default=None)
+            if pb_high is not None:
+                pullback_depth_pct = round(((pb_high - range_low) / range_height) * 100, 1)
+                pd = (pb_high - range_low) / range_height
+
+        if pullback_depth_pct is not None:
+            result["pullback_depth_percent_of_range"] = pullback_depth_pct
+            if pd <= 0:
+                pullback_hold_score = 2
+            elif pd <= 0.50:
+                pullback_hold_score = 1
+
+            mid_range = (range_high + range_low) / 2
+            if direction == "LONG":
+                if any(c.get("close") is not None and c["close"] < mid_range
+                       for c in recent_after_breakout):
+                    pullback_hold_score = 0
+            else:
+                if any(c.get("close") is not None and c["close"] > mid_range
+                       for c in recent_after_breakout):
+                    pullback_hold_score = 0
+
+    result["pullback_hold_score"] = pullback_hold_score
+
+    # 6. Total
+    wyckoff_cause_score = (
+        duration_score + range_compression_score +
+        displacement_score + phase_d_age_score + pullback_hold_score
+    )
+
+    chop_base = (
+        (inside_count > 168 and displacement_score <= 1) or
+        (range_atr_ratio is not None and range_atr_ratio > 5 and displacement_score <= 1)
+    )
+
+    if chop_base:
+        wyckoff_cause_score  = min(wyckoff_cause_score, 5)
+        base_strength_label  = "CHOP_BASE"
+    elif wyckoff_cause_score <= 4:
+        base_strength_label  = "WEAK_BASE"
+    elif wyckoff_cause_score <= 8:
+        base_strength_label  = "NORMAL_BASE"
+    elif wyckoff_cause_score <= 12:
+        base_strength_label  = "STRONG_BASE"
+    else:
+        base_strength_label  = "VERY_STRONG_BASE"
+
+    result["wyckoff_cause_score"] = wyckoff_cause_score
+    result["base_strength_label"] = base_strength_label
+    result["wyckoff_cause_note"]  = (
+        f"{base_strength_label}: duration={inside_count}h, "
+        f"range_atr={result.get('range_atr_ratio')}, "
+        f"disp_atr={sos_sow_displacement_atr}, "
+        f"phase_d_age={phase_d_age_bars}, "
+        f"pb_depth={pullback_depth_pct}%"
+    )
+    return result
+
+
 def compute_target_feasibility(setup, candles_5m):
     """
     Scores how feasible it is that price will reach TP2 (3R).
@@ -455,7 +686,9 @@ def compute_target_feasibility(setup, candles_5m):
                 "poc_score": 0, "momentum_score": 0, "atr_capacity_score": 0,
                 "nearest_obstacle": None, "nearest_obstacle_r": None,
                 "nearest_magnet": None, "poc": None, "poc_position": "unknown",
-                "tp2_atr_ratio": None}
+                "tp2_atr_ratio": None,
+                "wyckoff_cause_score": setup.get("wyckoff_cause_score", 0),
+                "base_strength_label": setup.get("base_strength_label", "UNKNOWN_BASE")}
 
     sign = 1 if direction == "LONG" else -1
     tp1  = setup.get("tp1b") or (entry + sign * 2.0 * risk)
@@ -488,19 +721,19 @@ def compute_target_feasibility(setup, candles_5m):
     nearest_obstacle_r = obstacles[0][2] if obstacles else None
 
     if not obstacles:
-        clean_path_score = 25
+        clean_path_score = 20
     elif obstacles[0][2] < 1.2:
         clean_path_score = 0
     elif obstacles[0][2] < 2.0:
-        clean_path_score = 10
+        clean_path_score = 8
     elif obstacles[0][2] < 3.0:
-        clean_path_score = 18
+        clean_path_score = 14
     else:
-        clean_path_score = 25
+        clean_path_score = 20
 
     # ── B) Liquidity magnet quality (0–20) ────────────────────
     nearest_magnet       = None
-    liquidity_magnet_score = 5  # default: mathematical target only
+    liquidity_magnet_score = 4  # default: mathematical target only
     tol = 0.015
 
     if direction == "LONG":
@@ -511,11 +744,11 @@ def compute_target_feasibility(setup, candles_5m):
         for p, ltype in candidates:
             dist = abs(p - tp2) / max(tp2, 0.0001)
             if dist <= tol:
-                liquidity_magnet_score = 20
+                liquidity_magnet_score = 18
                 nearest_magnet = f"{ltype} @ {p:.4f}"
                 break
-            elif p > tp1 and liquidity_magnet_score < 15:
-                liquidity_magnet_score = 10
+            elif p > tp1 and liquidity_magnet_score < 14:
+                liquidity_magnet_score = 9
                 nearest_magnet = nearest_magnet or f"{ltype} @ {p:.4f}"
     else:
         rl = setup["wyckoff"].get("range_low")
@@ -525,47 +758,47 @@ def compute_target_feasibility(setup, candles_5m):
         for p, ltype in sorted(candidates, reverse=True):
             dist = abs(p - tp2) / max(tp2, 0.0001)
             if dist <= tol:
-                liquidity_magnet_score = 20
+                liquidity_magnet_score = 18
                 nearest_magnet = f"{ltype} @ {p:.4f}"
                 break
-            elif p < tp1 and liquidity_magnet_score < 15:
-                liquidity_magnet_score = 10
+            elif p < tp1 and liquidity_magnet_score < 14:
+                liquidity_magnet_score = 9
                 nearest_magnet = nearest_magnet or f"{ltype} @ {p:.4f}"
 
     # ── C) POC alignment (0–20) ───────────────────────────────
     poc         = _poc_simple(candles_5m)
-    poc_score   = 12
+    poc_score   = 10
     poc_position = "unknown"
 
     if poc:
         if direction == "LONG":
             if poc < sl:
-                poc_score, poc_position = 8,  "below SL"
+                poc_score, poc_position = 6,  "below SL"
             elif sl <= poc <= entry:
-                poc_score, poc_position = 20, "support (SL–entry)"
+                poc_score, poc_position = 17, "support (SL–entry)"
             elif entry < poc <= tp1:
                 poc_score, poc_position = 0,  "obstacle (entry–TP1)"
             elif tp1 < poc <= tp2:
-                poc_score, poc_position = 5,  "mild obstacle (TP1–TP2)"
+                poc_score, poc_position = 4,  "mild obstacle (TP1–TP2)"
             else:
-                poc_score, poc_position = 20, "magnet above TP2"
+                poc_score, poc_position = 17, "magnet above TP2"
         else:
             if poc > sl:
-                poc_score, poc_position = 8,  "above SL"
+                poc_score, poc_position = 6,  "above SL"
             elif entry <= poc <= sl:
-                poc_score, poc_position = 20, "resistance (entry–SL)"
+                poc_score, poc_position = 17, "resistance (entry–SL)"
             elif tp1 <= poc < entry:
                 poc_score, poc_position = 0,  "obstacle (entry–TP1)"
             elif tp2 <= poc < tp1:
-                poc_score, poc_position = 5,  "mild obstacle (TP1–TP2)"
+                poc_score, poc_position = 4,  "mild obstacle (TP1–TP2)"
             else:
-                poc_score, poc_position = 20, "magnet below TP2"
+                poc_score, poc_position = 17, "magnet below TP2"
 
     # ── D) Momentum / displacement fuel (0–20) ────────────────
     pc         = setup.get("pattern", {}).get("candle", {})
     vol_bonus  = setup.get("vol_bonus", False)
     avg_vol    = setup.get("avg_vol_5m", 0)
-    momentum_score = 8
+    momentum_score = 7
 
     if pc:
         h, l, o, c, v = (pc.get("high",0), pc.get("low",0),
@@ -587,34 +820,37 @@ def compute_target_feasibility(setup, candles_5m):
         strong_volume = vol_bonus or (avg_vol > 0 and v >= avg_vol * 1.2)
 
         if strong_close and strong_body and strong_volume:
-            momentum_score = 20
+            momentum_score = 18
         elif strong_close and strong_body:
-            momentum_score = 15
+            momentum_score = 13
         elif strong_close or strong_body:
-            momentum_score = 12
-        # else stays 8
+            momentum_score = 10
+        # else stays 7
 
-    # ── E) ATR / volatility capacity (0–15) ───────────────────
+    # ── E) ATR / volatility capacity (0–12) ───────────────────
     atr_5m         = _compute_atr(candles_5m, 14)
-    atr_capacity_score = 10
+    atr_capacity_score = 8
     tp2_atr_ratio  = None
 
     if atr_5m and atr_5m > 0:
         dist_to_tp2   = abs(tp2 - entry)
         tp2_atr_ratio = dist_to_tp2 / atr_5m
         if tp2_atr_ratio <= 4:
-            atr_capacity_score = 15
+            atr_capacity_score = 12
         elif tp2_atr_ratio <= 7:
-            atr_capacity_score = 10
+            atr_capacity_score = 8
         elif tp2_atr_ratio <= 10:
-            atr_capacity_score = 5
+            atr_capacity_score = 4
         else:
             atr_capacity_score = 0
+
+    # ── F) Wyckoff cause (0–15, from compute_wyckoff_cause already in setup) ──
+    wcs = min(15, max(0, setup.get("wyckoff_cause_score", 0)))
 
     # ── Total ─────────────────────────────────────────────────
     tfs = max(0, min(100,
         clean_path_score + liquidity_magnet_score + poc_score +
-        momentum_score   + atr_capacity_score
+        momentum_score   + atr_capacity_score     + wcs
     ))
 
     if tfs >= 85:   verdict = "CLEAN PATH"
@@ -630,6 +866,8 @@ def compute_target_feasibility(setup, candles_5m):
         "poc_score":                poc_score,
         "momentum_score":           momentum_score,
         "atr_capacity_score":       atr_capacity_score,
+        "wyckoff_cause_score":      wcs,
+        "base_strength_label":      setup.get("base_strength_label", "UNKNOWN_BASE"),
         "nearest_obstacle":         nearest_obstacle,
         "nearest_obstacle_r":       round(nearest_obstacle_r, 2) if nearest_obstacle_r else None,
         "nearest_magnet":           nearest_magnet,
@@ -792,6 +1030,7 @@ def analyze_symbol(symbol, data, regime):
         "price":         price,
         "turnover":      turnover,
     }
+    setup.update(compute_wyckoff_cause(setup, data["timeframes"]))
     setup.update(compute_target_feasibility(setup, candles_5m))
     return setup
 
@@ -1001,32 +1240,32 @@ def recommend_model(s):
     entry_ext = s.get("entry_ext", 1.0)
     choch_age = s.get("choch_age", 999)
     status    = s.get("status", "")
-    regime    = s.get("regime", "unclear")
+    tfs       = s.get("target_feasibility_score", 0)
+    verdict   = s.get("verdict", "")
 
-    strong_status     = status in {"at_fvg", "at_order_block", "at_fvg_and_order_block"}
-    strong_confluence = status == "at_fvg_and_order_block"
+    active_category = category in {"premium_setup", "high_quality", "secondary_quality"}
+    valid_status    = status in {"at_fvg", "at_order_block", "at_fvg_and_order_block"}
 
-    # Defensive conditions → Model B has priority
-    defensive = (
-        regime == "chop"
-        or choch_age >= 4
-        or entry_ext > 0.25
-        or category == "secondary_quality"
-        or status == "confluence_zone"
-        or mps < 75
-        or (macd != "yes" and not strong_confluence)
-    )
-
-    if defensive:
+    # Hard defensive cases
+    if category in {"watchlist", "rejected"}:
+        return "Model B"
+    if verdict in {"TARGET BLOCKED", "NO FUEL"}:
+        return "Model B"
+    if choch_age >= 4:
+        return "Model B"
+    if entry_ext > 0.25:
+        return "Model B"
+    if status == "confluence_zone":
         return "Model B"
 
+    # v9.4: active fuel-filtered setups performed best with Model A
+    if active_category and tfs >= 55 and valid_status:
+        return "Model A"
     if category == "premium_setup":
         return "Model A"
-
-    if category == "high_quality" and mps >= 75:
+    if macd == "yes" and entry_ext <= 0.25 and valid_status:
         return "Model A"
-
-    if macd == "yes" and entry_ext <= 0.25 and strong_status:
+    if mps >= 75 and tfs >= 55:
         return "Model A"
 
     return "Model B"

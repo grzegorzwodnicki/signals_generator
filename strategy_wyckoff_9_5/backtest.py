@@ -14,7 +14,7 @@ Intrabar modes: conservative (SL wins on conflict) / optimistic (TP wins on conf
 
 Limit order TTL = next scan step. Unfilled orders cancelled.
 
-Użycie: python strategy_9_1/backtest.py
+Użycie: python strategy_wyckoff_9_5/backtest.py
 """
 
 import sys
@@ -22,6 +22,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import argparse
+import csv
 import json
 import math
 import time
@@ -188,7 +189,7 @@ def build_symbol_data(raw_data, sym, until_ts):
     price = tfs["5m"][-1]["close"] if tfs.get("5m") else 0
     return {
         "price":      price,
-        "turnover":   raw_data[sym].get("_turnover", 999_999_999),
+        "turnover":   raw_data.get(sym, {}).get("_turnover", 999_999_999),
         "timeframes": tfs,
     }
 
@@ -254,8 +255,15 @@ def _trade_record(top, step_dt, ts, next_ts, entry_mode):
         "choch_age":   top["choch_age"],
         "entry_ext":   top["entry_ext"],
         "pattern_type":             top.get("pattern_type", ""),
-        "target_feasibility_score": top.get("target_feasibility_score"),
-        "verdict":                  top.get("verdict"),
+        "target_feasibility_score":        top.get("target_feasibility_score"),
+        "verdict":                         top.get("verdict"),
+        "wyckoff_cause_score":             top.get("wyckoff_cause_score"),
+        "base_strength_label":             top.get("base_strength_label"),
+        "range_duration_hours":            top.get("range_duration_hours"),
+        "range_atr_ratio":                 top.get("range_atr_ratio"),
+        "sos_sow_displacement_atr":        top.get("sos_sow_displacement_atr"),
+        "phase_d_age_bars":                top.get("phase_d_age_bars"),
+        "pullback_depth_percent_of_range": top.get("pullback_depth_percent_of_range"),
         "signal_time": step_dt.strftime("%Y-%m-%d %H:%M"),
         "signal_ts":   ts,
         "ttl_ts":      next_ts,
@@ -269,6 +277,7 @@ def _trade_record(top, step_dt, ts, next_ts, entry_mode):
 def run_config(
     raw_data, symbols, start_dt, end_dt, scan_interval_h,
     cfg_name, model_name, conservative=True, entry_mode="limit",
+    debug_wcs=False,
 ):
     cfg         = CONFIGS[cfg_name]
     sim_fn      = MODELS[model_name]
@@ -277,6 +286,7 @@ def run_config(
     basket_size = cfg["basket_size"]
     use_core    = cfg.get("core_v93", False)
     market_mode = (entry_mode == "immediate")
+    _wcs_printed = 0
 
     active_trades   = []
     pending_orders  = []
@@ -377,6 +387,19 @@ def run_config(
             setup["mps"]      = st.manual_pick_score(setup)
             setup["category"] = st.classify(setup)
             setup["model"]    = st.recommend_model(setup)
+            if debug_wcs and _wcs_printed < 5:
+                _wcs_printed += 1
+                print(
+                    f"\n  [WCS] {setup['symbol']} {setup['direction']}"
+                    f"  rH={setup['wyckoff'].get('range_high'):.4f}"
+                    f"  rL={setup['wyckoff'].get('range_low'):.4f}"
+                    f"  dur={setup.get('range_duration_hours')}h"
+                    f"  disp_atr={setup.get('sos_sow_displacement_atr')}"
+                    f"  pd_age={setup.get('phase_d_age_bars')}"
+                    f"  wcs={setup.get('wyckoff_cause_score')}/15"
+                    f"  label={setup.get('base_strength_label')}"
+                    f"\n         note: {setup.get('wyckoff_cause_note')}"
+                )
             if setup["category"] not in allowed:
                 continue
             if use_core and not _passes_core_v93(setup):
@@ -792,6 +815,108 @@ def _trade_log_table(trades, label):
     )
 
 # ============================================================
+# WYCKOFF CAUSE BUCKET HELPERS
+# ============================================================
+
+def _bucket_wyckoff_cause(v):
+    if v is None: return "N/A"
+    if v <= 4:    return "0–4"
+    if v <= 8:    return "5–8"
+    if v <= 12:   return "9–12"
+    return "13–15"
+
+
+def _bucket_range_duration(hours):
+    if hours is None: return "N/A"
+    if hours < 8:     return "<8h"
+    if hours < 24:    return "8–24h"
+    if hours <= 72:   return "24–72h"
+    if hours <= 168:  return "72–168h"
+    return ">168h"
+
+
+def _bucket_phase_d_age(v):
+    if v is None: return "N/A"
+    if v <= 6:    return "0–6"
+    if v <= 24:   return "7–24"
+    return ">24"
+
+
+# ============================================================
+# CSV EXPORT
+# ============================================================
+
+_CSV_FIELDS = [
+    "config", "model_name", "intrabar", "entry_mode",
+    "symbol", "direction", "signal_time", "entry_time", "exit_time",
+    "entry_mid", "sl", "tp2", "tp3", "rr", "risk",
+    "category", "wyckoff", "status", "macd_5m",
+    "choch_age", "entry_ext", "pattern_type",
+    "mps", "ts_score",
+    "target_feasibility_score", "verdict",
+    "wyckoff_cause_score", "base_strength_label",
+    "range_duration_hours", "range_atr_ratio",
+    "sos_sow_displacement_atr", "phase_d_age_bars",
+    "pullback_depth_percent_of_range",
+    "exec_model", "exit_reason", "pnl_r", "mfe_r", "mae_r",
+    "bars_held", "conservative_intrabar",
+]
+
+
+def _export_csv(config_results, path):
+    rows = []
+    for (cfg, model_name, cons_label, entry_mode), (trades, _) in sorted(config_results.items()):
+        for t in trades:
+            rows.append({
+                "config":      cfg,
+                "model_name":  model_name,
+                "intrabar":    cons_label,
+                "entry_mode":  entry_mode,
+                "symbol":      t.get("symbol"),
+                "direction":   t.get("direction"),
+                "signal_time": t.get("signal_time"),
+                "entry_time":  t.get("entry_time"),
+                "exit_time":   t.get("exit_time"),
+                "entry_mid":   t.get("entry_mid"),
+                "sl":          t.get("sl"),
+                "tp2":         t.get("tp2"),
+                "tp3":         t.get("tp3"),
+                "rr":          t.get("rr"),
+                "risk":        t.get("risk"),
+                "category":    t.get("category"),
+                "wyckoff":     t.get("wyckoff"),
+                "status":      t.get("status"),
+                "macd_5m":     t.get("macd_5m"),
+                "choch_age":   t.get("choch_age"),
+                "entry_ext":   t.get("entry_ext"),
+                "pattern_type":             t.get("pattern_type"),
+                "mps":         t.get("mps"),
+                "ts_score":    t.get("ts_score"),
+                "target_feasibility_score": t.get("target_feasibility_score"),
+                "verdict":     t.get("verdict"),
+                "wyckoff_cause_score":             t.get("wyckoff_cause_score"),
+                "base_strength_label":             t.get("base_strength_label"),
+                "range_duration_hours":            t.get("range_duration_hours"),
+                "range_atr_ratio":                 t.get("range_atr_ratio"),
+                "sos_sow_displacement_atr":        t.get("sos_sow_displacement_atr"),
+                "phase_d_age_bars":                t.get("phase_d_age_bars"),
+                "pullback_depth_percent_of_range": t.get("pullback_depth_percent_of_range"),
+                "exec_model":  t.get("exec_model"),
+                "exit_reason": t.get("exit_reason"),
+                "pnl_r":       t.get("pnl_r"),
+                "mfe_r":       t.get("mfe_r"),
+                "mae_r":       t.get("mae_r"),
+                "bars_held":   t.get("bars_held"),
+                "conservative_intrabar": t.get("conservative_intrabar"),
+            })
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_CSV_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    return len(rows)
+
+
+# ============================================================
 # MAIN REPORT GENERATOR
 # ============================================================
 
@@ -919,18 +1044,26 @@ def generate_report(config_results, meta):
             "55–69" if (t.get("target_feasibility_score") or 0) < 70  else
             "70–84" if (t.get("target_feasibility_score") or 0) < 85  else "85+"
         ))
-        bd_verdict = _breakdown(trades, lambda t: t.get("verdict", "?"))
+        bd_verdict   = _breakdown(trades, lambda t: t.get("verdict", "?"))
+        bd_wcs       = _breakdown(trades, lambda t: _bucket_wyckoff_cause(t.get("wyckoff_cause_score")))
+        bd_base_str  = _breakdown(trades, lambda t: t.get("base_strength_label") or "UNKNOWN_BASE")
+        bd_range_dur = _breakdown(trades, lambda t: _bucket_range_duration(t.get("range_duration_hours")))
+        bd_pd_age    = _breakdown(trades, lambda t: _bucket_phase_d_age(t.get("phase_d_age_bars")))
 
         bds_html = (
-            _breakdown_table(bd_cat,     "By Category") +
-            _breakdown_table(bd_status,  "By Status") +
-            _breakdown_table(bd_macd,    "By MACD") +
-            _breakdown_table(bd_dir,     "Long vs Short") +
-            _breakdown_table(bd_choch,   "By ChoCH Age") +
-            _breakdown_table(bd_ext,     "By Entry Extension") +
-            _breakdown_table(bd_entry,   "By Entry Mode") +
-            _breakdown_table(bd_tfs,     "By Target Feasibility Score") +
-            _breakdown_table(bd_verdict, "By TFS Verdict")
+            _breakdown_table(bd_cat,      "By Category") +
+            _breakdown_table(bd_status,   "By Status") +
+            _breakdown_table(bd_macd,     "By MACD") +
+            _breakdown_table(bd_dir,      "Long vs Short") +
+            _breakdown_table(bd_choch,    "By ChoCH Age") +
+            _breakdown_table(bd_ext,      "By Entry Extension") +
+            _breakdown_table(bd_entry,    "By Entry Mode") +
+            _breakdown_table(bd_tfs,      "By Target Feasibility Score") +
+            _breakdown_table(bd_verdict,  "By TFS Verdict") +
+            _breakdown_table(bd_wcs,      "By Wyckoff Cause Score") +
+            _breakdown_table(bd_base_str, "By Base Strength") +
+            _breakdown_table(bd_range_dur,"By Range Duration") +
+            _breakdown_table(bd_pd_age,   "By Phase D Age (bars)")
         )
 
         # Accumulate for global edge section
@@ -939,6 +1072,8 @@ def generate_report(config_results, meta):
             ("Category", bd_cat), ("Status", bd_status), ("MACD", bd_macd),
             ("Direction", bd_dir), ("ChoCH", bd_choch), ("ExtBucket", bd_ext),
             ("EntryMode", bd_entry), ("TFS bucket", bd_tfs), ("TFS verdict", bd_verdict),
+            ("WyckoffCause", bd_wcs), ("BaseStrength", bd_base_str),
+            ("RangeDuration", bd_range_dur), ("PhaseDAge", bd_pd_age),
         ]:
             for r in rows:
                 all_breakdowns_global.append((f"{run_tag} · {dim_label}", [r]))
@@ -982,7 +1117,7 @@ def generate_report(config_results, meta):
     footer = (
         f'<div style="background:#0a0f1a;border-top:1px solid #1e2d40;'
         f'padding:14px 32px;font-size:11px;color:#556677">'
-        f'strategy_9_1 strict backtest | Dane historyczne z Bybit Linear | '
+        f'strategy_wyckoff_9_5 strict backtest | Dane historyczne z Bybit Linear | '
         f'Wyniki historyczne nie gwarantują przyszłych zysków. '
         f'Wygenerowano: {meta["report_time"]}</div>'
     )
@@ -1105,6 +1240,7 @@ def main():
     n_runs = len(chosen_cfgs) * len(chosen_models) * len(chosen_cons) * len(chosen_entries)
     print(f"\n[3/3] Symulacja — {n_runs} przebiegów...")
     config_results = {}
+    _first_run = True
 
     for cfg_name in chosen_cfgs:
         for model_name in chosen_models:
@@ -1117,7 +1253,9 @@ def main():
                     trades, orders, concurrent_hist = run_config(
                         raw_data, symbols, start_dt, end_dt, scan_h,
                         cfg_name, model_name, cons_val, entry_mode,
+                        debug_wcs=_first_run,
                     )
+                    _first_run = False
                     stats = compute_stats(
                         trades,
                         concurrent_hist if basket > 1 else None,
@@ -1151,6 +1289,10 @@ def main():
     with open(outfile, "w", encoding="utf-8") as f:
         f.write(html)
     print(f"\n✅ Raport: {outfile}")
+
+    csv_file = os.path.join(RESULTS_DIR, f"backtest_{start_tag}_{end_tag}_{fuel_label}_trades.csv")
+    n_rows = _export_csv(config_results, csv_file)
+    print(f"✅ CSV:   {csv_file}  ({n_rows} wierszy)")
 
     try:
         subprocess.Popen(["open", "-a", "Google Chrome", os.path.abspath(outfile)])

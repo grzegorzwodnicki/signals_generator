@@ -8,3 +8,10 @@ strategy_9_1/cache
 strategy_9_1/results
 *.pyc
 __pycache__
+strategy_wyckoff_9_4/results
+strategy_wyckoff_9_4/output
+strategy_wyckoff_9_4/cache
+strategy_wyckoff_9_5/results
+strategy_wyckoff_9_5/output
+strategy_wyckoff_9_5/cache
+strategy_wyckoff_9_5/__pycache__

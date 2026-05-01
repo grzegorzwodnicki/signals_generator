@@ -445,6 +445,191 @@ def render_table(setups):
     </table></div>"""
 
 # ============================================================
+# WATCHLIST REVIEW HELPERS
+# ============================================================
+
+def _watchlist_rank_key(s):
+    return (
+        s.get("mps", 0),
+        s.get("target_feasibility_score", 0),
+        s.get("ts", 0),
+        1 if s.get("verdict") in ("CLEAN PATH", "TARGET POSSIBLE", "TARGET DIFFICULT") else 0,
+        1 if s.get("status") in ("at_fvg", "at_order_block", "at_fvg_and_order_block") else 0,
+        -s.get("entry_ext", 1.0),
+    )
+
+
+def _is_manual_review_candidate(s):
+    if s.get("category") != "watchlist":
+        return False
+    if s.get("macd_5m") == "against":
+        return False
+    if s.get("verdict") == "NO FUEL":
+        return False
+    if s.get("entry_ext", 1.0) > 0.50:
+        return False
+    if s.get("rr", 0) < 1.5:
+        return False
+    if s.get("choch_age", 999) > 4:
+        return False
+    if (s.get("fvg") or {}).get("filled"):
+        return False
+    return True
+
+
+def _missing_reasons(s):
+    reasons = []
+    if s.get("target_feasibility_score", 0) < 55:
+        reasons.append(f'TFS only {s.get("target_feasibility_score","N/A")}/100')
+    if s.get("verdict") in ("TARGET DIFFICULT", "TARGET BLOCKED", "NO FUEL"):
+        reasons.append(f'Target verdict: {s.get("verdict")}')
+    if s.get("choch_age", 999) > 2:
+        reasons.append(f'ChoCH age {s.get("choch_age")}c')
+    if s.get("entry_ext", 0) > 0.25:
+        reasons.append(f'Entry extension {_pct(s.get("entry_ext"))}')
+    if s.get("status") == "confluence_zone":
+        reasons.append("Confluence only — no direct FVG/OB entry status")
+    if s.get("macd_5m") == "none":
+        reasons.append("MACD neutral / no divergence")
+    if not s.get("touches_fvg") and not s.get("touches_ob"):
+        reasons.append("Pattern does not touch FVG/OB")
+    if s.get("rr", 0) < 2.0:
+        reasons.append(f'R:R only {s.get("rr",0):.2f}R')
+    if (s.get("fvg") or {}).get("filled"):
+        reasons.append("FVG filled")
+    if not reasons:
+        reasons.append("Manual review required — software classified as watchlist")
+    return reasons
+
+
+def _manual_confirmations_needed(s):
+    checks = []
+    if s.get("target_feasibility_score", 0) < 55:
+        checks.append("Confirm manually that target path is clear enough")
+    if s.get("verdict") == "TARGET BLOCKED":
+        checks.append("Check if obstacle was already broken or reduce TP target")
+    if s.get("verdict") == "TARGET DIFFICULT":
+        checks.append("Consider lower TP: 1.2R–1.5R or POC target")
+    if s.get("choch_age", 999) > 2:
+        checks.append("Confirm price has not moved too far from entry zone")
+    if s.get("entry_ext", 0) > 0.25:
+        checks.append("Wait for better entry closer to FVG/OB")
+    if s.get("status") == "confluence_zone":
+        checks.append("Confirm real entry trigger at FVG/OB manually")
+    if s.get("macd_5m") == "none":
+        checks.append("Check momentum manually — MACD gives no confirmation")
+    if not s.get("touches_fvg") and not s.get("touches_ob"):
+        checks.append("Confirm pattern candle really reacts from the zone")
+    if not checks:
+        checks.append("Manual chart confirmation before entry")
+    return checks
+
+
+def render_watchlist_review_card(s, rank):
+    pr     = s.get("price", 0)
+    missing = _missing_reasons(s)
+    checks  = _manual_confirmations_needed(s)
+    tfs     = s.get("target_feasibility_score")
+    verdict = s.get("verdict", "")
+
+    missing_html = "".join(
+        f'<li style="margin-bottom:4px;color:#ffcc88">{m}</li>'
+        for m in missing
+    )
+    checks_html = "".join(
+        f'<li style="margin-bottom:4px;color:#aaddff">□ {c}</li>'
+        for c in checks
+    )
+    model_note = "Model B / reduced target preferred unless manually upgraded"
+    if (tfs or 0) >= 55 and verdict in ("CLEAN PATH", "TARGET POSSIBLE"):
+        model_note = "Model A possible after manual confirmation"
+
+    blocked_warning = ""
+    if verdict == "TARGET BLOCKED":
+        blocked_warning = (
+            '<div style="margin-top:8px;background:#2a0a00;border-left:3px solid #ff8844;'
+            'padding:8px 10px;border-radius:4px;font-size:12px;color:#ff8844">'
+            '⚠ TARGET BLOCKED — use reduced TP (POC / nearest liquidity) or skip trade.</div>'
+        )
+
+    d_color = "#00ff8c" if s.get("direction") == "LONG" else "#ff4d4d"
+
+    return f"""
+<div style="background:#101827;border:1px solid #4488ff;border-radius:8px;padding:18px;margin-bottom:16px;box-shadow:0 0 12px rgba(68,136,255,0.18)">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap">
+    <div>
+      <div style="font-size:12px;color:#88ccff;font-weight:bold;margin-bottom:4px;letter-spacing:1px">
+        🔍 WATCHLIST MANUAL REVIEW #{rank}
+      </div>
+      <div style="font-size:22px;font-weight:bold;color:#e6edf7">
+        {s.get("symbol","?")} <span style="color:{d_color}">{s.get("direction","?")}</span>
+      </div>
+      <div style="margin-top:6px">
+        {_cat_badge(s.get("category","watchlist"))}
+        {_status_badge(s.get("status",""))}
+        {_macd_badge(s.get("macd_5m","none"))}
+        {_verdict_badge(verdict)}
+        {_base_badge(s.get("base_strength_label","UNKNOWN_BASE"))}
+      </div>
+    </div>
+    <div style="text-align:right">
+      <div style="font-size:24px;color:#88ccff;font-weight:bold">{s.get("mps","N/A")}</div>
+      <div style="font-size:11px;color:#8899aa">MPS</div>
+      <div style="font-size:12px;color:#ffd700;margin-top:4px">TFS: {tfs if tfs is not None else "N/A"}/100</div>
+      <div style="font-size:12px;color:#8899aa">Score: {s.get("ts","N/A")}</div>
+    </div>
+  </div>
+
+  <div style="margin-top:12px;padding:10px;background:#08111d;border-left:3px solid #4488ff;color:#cfe8ff;font-size:12px;border-radius:0 4px 4px 0">
+    <strong>⚠ NOT AN ACTIVE SIGNAL</strong> — Manual review candidate. Take only after confirming the missing condition on the chart.
+  </div>
+  {blocked_warning}
+
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px;margin-top:12px">
+    <div style="background:#0d1520;border-radius:6px;padding:12px">
+      <div style="color:#ffcc00;font-weight:bold;margin-bottom:8px;font-size:13px">⚠ Missing / Weak Points</div>
+      <ul style="padding-left:18px;margin:0;font-size:12px">{missing_html}</ul>
+    </div>
+
+    <div style="background:#0d1520;border-radius:6px;padding:12px">
+      <div style="color:#88ccff;font-weight:bold;margin-bottom:8px;font-size:13px">🔍 Manual Confirmation Needed</div>
+      <ul style="padding-left:0;margin:0;list-style:none;font-size:12px">{checks_html}</ul>
+    </div>
+
+    <div style="background:#0d1520;border-radius:6px;padding:12px">
+      <div style="color:#00ffcc;font-weight:bold;margin-bottom:8px;font-size:13px">📌 Conditional Trade Plan</div>
+      {_row("Entry",         _f(s.get("entry_mid"), pr))}
+      {_row("SL",            _f(s.get("sl"), pr), "#ff4d4d")}
+      {_row("TP1a (1.1R)",   _f(s.get("tp1a"), pr))}
+      {_row("TP1b (2.0R)",   _f(s.get("tp1b"), pr))}
+      {_row("TP2",           _f(s.get("tp2"), pr), "#00ff8c")}
+      {_row("R:R",           f'{s.get("rr",0):.2f}R')}
+      {_row("Management",    model_note)}
+    </div>
+
+    <div style="background:#0d1520;border-radius:6px;padding:12px">
+      <div style="color:#00aaff;font-weight:bold;margin-bottom:8px;font-size:13px">🎯 Target / Fuel</div>
+      {_row("TFS",             f'{tfs if tfs is not None else "N/A"}/100')}
+      {_row("Verdict",         _verdict_badge(verdict))}
+      {_row("Nearest Obstacle",s.get("nearest_obstacle") or "–")}
+      {_row("Nearest Magnet",  s.get("nearest_magnet") or "–")}
+      {_row("TP2 ATR Ratio",   str(s.get("tp2_atr_ratio","N/A")))}
+      {_row("WCS",             f'{s.get("wyckoff_cause_score","N/A")}/15')}
+    </div>
+  </div>
+
+  <div style="margin-top:12px;background:#0d1520;border-radius:6px;padding:12px">
+    <div style="color:#00aaff;font-weight:bold;margin-bottom:6px;font-size:13px">🧠 Manual Decision Rule</div>
+    <div style="font-size:12px;color:#cfe8ff;line-height:1.6">
+      Accept manually only if: price is still near FVG/OB, target obstacle is not blocking the move,
+      ChoCH is still relevant, and entry can be taken with acceptable R:R.
+      If target is blocked, reduce TP to POC / nearest liquidity or skip the trade.
+    </div>
+  </div>
+</div>"""
+
+
+# ============================================================
 # RAPORT HTML
 # ============================================================
 
@@ -468,6 +653,9 @@ def generate_html(all_setups, meta):
 
     active = sorted(premium + hq + sec, key=_live_rank_key, reverse=True)[:15]
 
+    manual_watchlist    = [s for s in watchlist if _is_manual_review_candidate(s)]
+    top_watchlist_review = sorted(manual_watchlist, key=_watchlist_rank_key, reverse=True)[:4]
+
     top_picks = [
         s for s in active
         if s.get("mps", 0) >= 70
@@ -484,8 +672,9 @@ def generate_html(all_setups, meta):
         ("Premium",         len(premium),    "#00ff8c"),
         ("High Quality",    len(hq),         "#00ffcc"),
         ("Secondary",       len(sec),        "#88ccff"),
-        ("Watchlist",       len(watchlist),  "#4488ff"),
-        ("Rejected",        len(rejected),   "#ff4d4d"),
+        ("Watchlist",        len(watchlist),           "#4488ff"),
+        ("Watchlist Review", len(top_watchlist_review), "#88ccff"),
+        ("Rejected",         len(rejected),            "#ff4d4d"),
         ("Fuel ON",         "YES",           "#00ff8c"),
         ("TFS ≥ 70",        sum(1 for s in active if (s.get("target_feasibility_score") or 0) >= 70), "#00ff8c"),
         ("TFS 55–69",       sum(1 for s in active if 55 <= (s.get("target_feasibility_score") or 0) < 70), "#ffd700"),
@@ -518,6 +707,25 @@ def generate_html(all_setups, meta):
         picks_html = '<div style="text-align:center;padding:40px;color:#556677;font-size:18px">⚠ No high-confidence manual trade today.</div>'
 
     cards_html = "".join(render_card(s) for s in active)
+
+    if top_watchlist_review:
+        wl_cards = "".join(
+            render_watchlist_review_card(s, i + 1)
+            for i, s in enumerate(top_watchlist_review)
+        )
+        watchlist_review_html = f"""
+<div style="padding:0 32px 24px">
+  <h2 style="color:#88ccff;border-bottom:1px solid #1e2d40;padding-bottom:8px;margin-bottom:14px">
+    🔍 Top Watchlist Manual Review Candidates
+  </h2>
+  <div style="background:#08111d;border-left:4px solid #4488ff;padding:12px 14px;margin-bottom:16px;color:#cfe8ff;font-size:13px;border-radius:0 6px 6px 0">
+    To <strong>NIE są aktywne sygnały</strong>. To najmocniejsze setupy z watchlisty do ręcznej weryfikacji.
+    Można je rozważyć tylko wtedy, gdy trader ręcznie potwierdzi brakujący element.
+  </div>
+  {wl_cards}
+</div>"""
+    else:
+        watchlist_review_html = ""
 
     watchlist_rows = "".join(
         f'<tr><td style="font-weight:bold">{s["symbol"]}</td>'
@@ -632,6 +840,8 @@ def generate_html(all_setups, meta):
   <h2 style="border-bottom:1px solid #1e2d40;padding-bottom:8px;margin-bottom:16px">🔍 Active Setup Detail Cards</h2>
   {cards_html}
 </div>
+
+{watchlist_review_html}
 
 <div style="padding:0 32px 24px">
   <h2 style="border-bottom:1px solid #1e2d40;padding-bottom:8px;margin-bottom:16px">👁 Watchlist</h2>

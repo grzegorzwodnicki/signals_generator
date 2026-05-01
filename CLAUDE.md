@@ -8,10 +8,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 | File | Role |
 |---|---|
-| `strategy_wyckoff_9_5/strategy.py` | Shared logic: data fetching, Wyckoff, FVG, OB, ChoCH, scoring, classify, TFS, Wyckoff Cause |
+| `strategy_wyckoff_9_5/config.py` | Central config: version, thresholds, output flags — **edit here, not scanner.py** |
+| `strategy_wyckoff_9_5/strategy.py` | Shared logic: data fetching, Wyckoff, FVG, OB, ChoCH, scoring, classify, TFS, Wyckoff Cause, multi-family (v95) |
 | `strategy_wyckoff_9_5/execution.py` | Trade simulation engine: Model A, Model B, FIXED_R, MFE/MAE, conservative/optimistic intrabar |
-| `strategy_wyckoff_9_5/scanner.py` | Live scan + HTML report (v9.5) |
-| `strategy_wyckoff_9_5/backtest.py` | Historical simulation: multi-config × multi-model × multi-mode |
+| `strategy_wyckoff_9_5/scanner.py` | Live scan + HTML report (v9.5, multi-family) |
+| `strategy_wyckoff_9_5/backtest.py` | Historical simulation: multi-config × multi-model × multi-mode × multi-family |
 
 Both `scanner.py` and `backtest.py` do `sys.path.insert(0, dirname)` so `import strategy` resolves to the sibling `strategy.py`. Run from project root:
 
@@ -29,7 +30,7 @@ Output dirs (all relative to the script's own directory):
 
 Frozen v9.4 baseline. Do not modify — used as comparison point for v9.5 work.
 
-Same file structure as v9.5. Scanner output goes to `strategy_wyckoff_9_4/output/`.
+Same file structure as v9.5. Scanner output goes to `strategy_wyckoff_9_4/output/`. Exception: v9.4 scanner has a "Top Watchlist Manual Review Candidates" section added by explicit request — this is the only intentional post-freeze modification.
 
 ### Legacy / other files
 - **`research/backtest.py`** — old backtest, now orphaned
@@ -52,10 +53,54 @@ python strategy_wyckoff_9_5/scanner.py
 ```
 
 Interactive: `t` = live data, `h` = historical (`dd/mm/yyyy hh:mm`).
-Output: `strategy_wyckoff_9_5/output/signals_YYYY_MM_DD_HHMM.html`, auto-opens Chrome.
 
-Fuel Filter is forced ON in `main()` (`st.USE_TARGET_FEASIBILITY_FILTER = True`).
-Default trade management: **Model A** (per v9.4 backtest results).
+**Scanner outputs (live mode only):**
+- `output/signals_YYYY_MM_DD_HHMM.html` — timestamped report (if `WRITE_TIMESTAMPED_HTML`)
+- `output/latest.html` — always-overwritten latest report (if `WRITE_LATEST_HTML`)
+- `output/alerts.json` — top picks + WL review in machine-readable form (if `WRITE_ALERTS_JSON`)
+- `output/alert_state.json` — cooldown state, persisted between runs
+- `output/scan_log.csv` — append-mode per-setup log (if `WRITE_SCAN_LOG_CSV`)
+
+All output flags and thresholds are in `config.py`. `USE_TARGET_FEASIBILITY_FILTER` is read from `cfg` in `main()` — do **not** hardcode it.
+
+Default trade management: **family-aware** — Model A for WYCKOFF_STRICT / strongest setups, Model B defensive.
+
+## `strategy_wyckoff_9_5/config.py`
+
+Single source of truth for all scanner settings. Key fields:
+
+```python
+SCANNER_VERSION = "v9.5"        # used in HTML title, print banner, alerts.json engine field
+ENGINE          = "v95"         # controls which analysis path runs in backtest
+USE_TARGET_FEASIBILITY_FILTER = True
+
+ACTIVE_SETUP_FAMILIES = {"WYCKOFF_STRICT", "TREND_PULLBACK"}
+
+SCAN_TOP_N               = 400
+LIVE_SCAN_INTERVAL_MINUTES = 60
+MAX_ACTIVE_SETUPS_HTML   = 15
+MAX_TOP_PICKS            = 3
+MAX_WATCHLIST_REVIEW     = 4
+
+ALERT_COOLDOWN_HOURS          = 6
+SYMBOL_DIRECTION_COOLDOWN_HOURS = 6
+SAME_FAMILY_COOLDOWN_HOURS    = 6
+
+ENABLE_WATCHLIST_REVIEW  = True
+WATCHLIST_REVIEW_MIN_MPS = 55
+WATCHLIST_REVIEW_MIN_TFS = 40
+
+DEFAULT_TREND_PULLBACK_MODEL    = "Model B"
+AGGRESSIVE_TREND_PULLBACK_MODEL = "FIXED_2R"
+DEFAULT_WYCKOFF_MODEL           = "Model A"
+
+WRITE_LATEST_HTML      = True
+WRITE_TIMESTAMPED_HTML = True
+WRITE_ALERTS_JSON      = True
+WRITE_SCAN_LOG_CSV     = True
+```
+
+To change the version, bump `SCANNER_VERSION` here only — all HTML and print statements read from `meta["scanner_version"]`.
 
 ## API credentials
 
@@ -75,11 +120,36 @@ BACKTEST_TIME_MS = None               # set by scanner/backtest before fetching
 USE_TARGET_FEASIBILITY_FILTER = True  # controls TFS gates in classify() and MPS
 ```
 
-Set `st.USE_TARGET_FEASIBILITY_FILTER = False` (or `--fuel-filter off`) for a baseline run with no TFS influence.
+Scanner sets this from `cfg.USE_TARGET_FEASIBILITY_FILTER`. Backtest sets via `--fuel-filter on|off`.
+
+### Setup families (v9.5 multi-family)
+
+Two active families:
+
+| Family | Detection function | Key fields |
+|---|---|---|
+| `WYCKOFF_STRICT` | `analyze_symbol()` | Wyckoff accumulation/distribution, Phase D, SOS/SOW |
+| `TREND_PULLBACK` | `detect_trend_pullback()` | HTF trend (1H + 4H) + LTF FVG/OB pullback |
+
+`detect_trend_pullback()` key fields added to setup:
+- `zone_type`: `"DEMAND"` (LONG) / `"SUPPLY"` (SHORT)
+- `setup_variant`: `"HTF_{direction}_{zone_type}_PULLBACK_{loc_label}"` (e.g. `HTF_LONG_DEMAND_PULLBACK_FVG`)
+- `trend_conflict`: `True` if 1H and 4H disagree — reported in family panel, not a hard reject
+- `htf_context`, `family_reason`, `family_risk`, `countertrend`, `recommended_tp_mode`
+
+### `analyze_symbol_v95()` — classify-before-select design
+
+Runs both WYCKOFF_STRICT and TREND_PULLBACK candidates, scores and classifies **all of them first**, then selects the best using:
+
+```python
+rank = (is_active, mps, tfs, family_priority, is_clean_path, ts, -entry_ext)
+```
+
+This ensures an active TREND_PULLBACK beats a watchlist WYCKOFF_STRICT, regardless of family priority order.
 
 ### Data pipeline
 
-1. **Fetching** — `get_top_crypto()` → `fetch_symbol_data()` via `ThreadPoolExecutor` (25 workers, semaphore-capped). `get_400_candles()` fetches two batches of 200 candles; second batch uses `min(timestamps)` of first batch as the `end_time` anchor (safe regardless of Bybit sort order).
+1. **Fetching** — `get_top_crypto()` → `fetch_symbol_data()` via `ThreadPoolExecutor` (25 workers, semaphore-capped). `get_400_candles()` fetches two batches of 200 candles; second batch uses `min(timestamps)` of first batch as the `end_time` anchor.
 2. **Technical analysis** per symbol (5M candles unless noted):
    - `detect_wyckoff()` — 1H candles; 80th/20th percentile of last 45 bars defines range; SOS/SOW detected in **last 15 bars**
    - `detect_fvg()` — lookback 120 candles
@@ -90,7 +160,7 @@ Set `st.USE_TARGET_FEASIBILITY_FILTER = False` (or `--fuel-filter off`) for a ba
 3. **Wyckoff Cause** — `compute_wyckoff_cause(setup, data_by_tf)` — called first in `analyze_symbol()`, before TFS
 4. **Target Feasibility** — `compute_target_feasibility(setup, candles_5m)` — reads `wyckoff_cause_score` already in setup
 5. **Scoring** — `total_score()` (0–100) + `manual_pick_score()` (0–100; TFS component gated by `USE_TARGET_FEASIBILITY_FILTER`)
-6. **Classification** — `classify()` → `premium_setup / high_quality / secondary_quality / watchlist / rejected`
+6. **Classification** — `classify_v95()` → `premium_setup / high_quality / secondary_quality / watchlist / rejected`
 
 `analyze_symbol()` call order:
 ```python
@@ -107,7 +177,7 @@ return setup
 
 ## Filter thresholds — v9.5
 
-`classify()` hard rejects (always active, not gated by flag):
+`classify_v95()` hard rejects (always active, not gated by flag):
 
 | Condition | Rule |
 |---|---|
@@ -116,6 +186,7 @@ return setup
 | R:R | < 2.0 |
 | FVG filled | yes |
 | ChoCH age | > 4c |
+| Verdict | `TARGET BLOCKED` or `TARGET_BLOCKED` (both forms accepted) |
 
 TFS-gated rejects (only when `USE_TARGET_FEASIBILITY_FILTER = True`):
 
@@ -140,9 +211,10 @@ Classification thresholds:
 - **`confluence_zone` only**: watchlist unless MACD yes + ChoCH ≤ 2c + entry_ext ≤ 0.25
 - **entry_ext 0.25–0.50**: needs ≥ 3 premium confirmations or → watchlist
 
-`recommend_model()` — v9.4/v9.5 logic (less defensive than earlier versions):
-- Hard → Model B: watchlist/rejected category, verdict TARGET BLOCKED/NO FUEL, ChoCH ≥ 4, entry_ext > 0.25, confluence_zone
-- → Model A: active category + TFS ≥ 55 + valid status; or premium_setup; or MACD yes + entry_ext ≤ 0.25 + valid status; or MPS ≥ 75 + TFS ≥ 55
+`recommend_model_v95()` — family-aware:
+- TREND_PULLBACK → Model B by default; Model A if TFS ≥ 65 + verdict CLEAN/POSSIBLE
+- Hard → Model B: watchlist/rejected, TARGET BLOCKED/NO FUEL, ChoCH ≥ 4, entry_ext > 0.25, confluence_zone
+- → Model A: active + TFS ≥ 55 + valid status; or premium_setup; or MACD yes + entry_ext ≤ 0.25; or MPS ≥ 75 + TFS ≥ 55
 
 ## Wyckoff Cause / Base Strength (`compute_wyckoff_cause`)
 
@@ -185,13 +257,63 @@ Scores how feasible it is that price reaches TP2. Max 100 across 6 components:
 
 ## Scanner HTML report — v9.5
 
-Active setups sorted by `_live_rank_key`: MPS → TFS → verdict → base strength → model → ts → −entry_ext.
+Active setups sorted by `_live_rank_key` → `st.rank_key_v95(s)`: MPS → TFS → verdict → base strength → model → ts → −entry_ext.
 
 TOP PICKS filter: MPS ≥ 70 + TFS ≥ 55 + verdict ∉ {TARGET BLOCKED, NO FUEL}.
 
 Detail card panel order: Wyckoff → Wyckoff Cause → ChoCH/Pattern + Trade Plan → Target Feasibility + MPS + MACD/Regime → Model A plan (if model=A) → Trigger Checklist → Invalidation.
 
-Table columns: # · Symbol · Dir · Wyckoff · Category · MPS · Score · **TFS · Verdict · WCS · Base · Obstacle · Magnet** · Status · Pattern · ChoCH · EntExt · FVG · FVG+OB · Entry · SL · TP1a · TP1b · TP2 · R:R · MACD · Model
+Table columns: # · Symbol · Dir · Wyckoff · Category · MPS · Score · **TFS · Verdict · WCS · Base · Obstacle · Magnet** · Status · Pattern · ChoCH · EntExt · FVG · FVG+OB · Entry · SL · TP1a · TP1b · TP2 · R:R · MACD · Model · **Family**
+
+Family summary breakdown section shows: Family · Active · Premium · HQ · Avg TFS · Avg MPS · Top Symbols.
+
+Watchlist Fuel Candidates section (if `ENABLE_WATCHLIST_REVIEW`): strongest watchlist setups for manual chart verification, filtered by `_is_fuel_candidate()`, sorted by `_watchlist_fuel_rank()`.
+
+### `generate_html()` signature
+
+```python
+def generate_html(all_setups, meta, now_dt=None, alert_state=None):
+    ...
+    return _html, top_picks, fuel_candidates  # tuple — unpack in caller
+```
+
+`meta` dict expected keys: `report_time`, `data_time`, `is_backtest`, `total_symbols`, `regime`, `btc_regime`, `eth_regime`, `scanner_version`, `fuel_filter`.
+
+### `_entry_price(s)` helper
+
+```python
+def _entry_price(s):
+    return s.get("entry_mid") or s.get("entry")
+```
+
+Used in `alerts.json` and `scan_log.csv` writes. Do not use `s.get("entry")` directly — setup fields use `entry_mid` as the primary price key.
+
+### Alert cooldown system
+
+- State stored in `output/alert_state.json`, keyed by `_alert_key(s)` = `"{symbol}_{direction}_{family}"`
+- `_cooldown_status(s, state, now_dt, hours)` → `"NEW"` / `"COOLDOWN"` / `"SEEN"`
+- Cooldown badge shown on each TOP PICK in HTML
+- After each scan, `alert_state` is updated with `last_seen / last_mps / last_tfs / last_category / last_verdict` for each top pick
+- Skipped entirely in backtest mode
+
+### `scan_log.csv` columns
+
+`timestamp · symbol · direction · setup_family · setup_variant · category · mps · ts · tfs · verdict · model · entry · sl · tp1a · tp1b · tp2 · rr · status · macd_5m · choch_age · entry_ext · trend_conflict · base_strength_label · watchlist_review_candidate · alert_status`
+
+Appended each scan for all active setups + fuel candidates. Active setups = `premium_setup | high_quality | secondary_quality`.
+
+### `alerts.json` structure
+
+```json
+{
+  "generated_at": "2026-05-01 12:00:00",
+  "engine": "v9.5",
+  "top_picks": [{"symbol":..., "direction":..., "setup_family":..., "entry":..., ...}],
+  "watchlist_review": [...]
+}
+```
+
+`entry` uses `_entry_price(s)` — never `s.get("entry")` directly.
 
 ## Key implementation details
 
@@ -207,7 +329,7 @@ Table columns: # · Symbol · Dir · Wyckoff · Category · MPS · Score · **TF
 **Models:**
 - `simulate_model_a(setup, candles_5m, conservative=True)` — 35% @ 1.1R → BE, 35% @ 2.0R, 30% @ 3.0R. Max = 1.985R.
 - `simulate_model_b(setup, candles_5m, conservative=True)` — 50% @ 1.1R → BE, 50% @ 2.0R. Max = 1.55R.
-- `simulate_auto_model(setup, candles_5m, conservative=True)` — reads `setup["model"]` from `recommend_model()`.
+- `simulate_auto_model(setup, candles_5m, conservative=True)` — reads `setup["model"]` from `recommend_model_v95()`.
 - `simulate_fixed_r(setup, candles_5m, tp_mult, conservative=True)` — single position, SL = −1R, TP = +mult×R, no partials.
 - `simulate_fixed_2r` / `simulate_fixed_15r` / `simulate_fixed_3r` — convenience wrappers for 2.0R, 1.5R, 3.0R.
 
@@ -226,6 +348,12 @@ python strategy_wyckoff_9_5/backtest.py [--fuel-filter on|off]
 
 `--fuel-filter off` sets `st.USE_TARGET_FEASIBILITY_FILTER = False` before any simulation → TFS disabled. Default: `on` (TFS active).
 
+**ENGINE constant:** `ENGINE = "v95"` — controls which analysis/classify/recommend functions run. When `"v95"`: uses `analyze_symbol_v95()`, `classify_v95()`, `recommend_model_v95()`.
+
+**TF fetched:** `BT_TIMEFRAMES = ["4H", "1H", "30m", "15m", "5m"]` — 4H required for TREND_PULLBACK HTF detection.
+
+**Cache filename:** `bt_{start}_{end}_top{N}_4H1H30m15m5m.json` — TF set encoded in name to prevent old caches without 4H from being reused.
+
 **Configurations (CONFIGS dict):**
 
 | Name | Top-N | Category filter | basket_size | core_v93 |
@@ -241,7 +369,18 @@ python strategy_wyckoff_9_5/backtest.py [--fuel-filter on|off]
 
 **Models:** `A` / `B` / `Auto` / `FIXED_2R` / `FIXED_1_5R` / `FIXED_3R`
 
-**Interactive prompts:** start/end date · scan interval · top-N symbols · configs · models · intrabar mode (`c`/`o`/`co`) · entry mode (`l`=limit / `i`=immediate / `li`=both)
+**Interactive prompts:** start/end date · scan interval · top-N symbols · configs · models · intrabar mode (`c`/`o`/`co`) · entry mode (`l`=limit / `i`=immediate / `li`=both) · **cooldown hours** · **max one per day** · **enabled families** · **exclude OB-only**
+
+**`run_config()` dedup parameters:**
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `cooldown_hours=0` | off | Skip symbol if last entry was within N hours |
+| `max_one_per_day=False` | off | Only one trade per symbol per calendar day |
+| `enabled_families=None` | all | Filter to specific setup families (v95 only) |
+| `exclude_ob_only=False` | off | Skip setups where `setup_variant` ends with `_OB` |
+
+`last_entry_by_sym` dict tracks when each symbol last had a trade placed. Updated at the moment of placing (not filling). Dedup label encoded in output filename, e.g. `_cd6h_1perday_famTR_noOB`.
 
 **Four dimensions per run:** config × model × intrabar × entry_mode → `config_results` keyed by `(cfg_name, model_name, cons_label, entry_mode)` 4-tuple.
 
@@ -253,17 +392,15 @@ python strategy_wyckoff_9_5/backtest.py [--fuel-filter on|off]
 
 **Statistics (`compute_stats`):** `positive_wins` / `full_wins` / `partial_wins` / `losses` / `no_exit` · `win_rate` (pnl_r > 0 / closed) · `total_r` · `ev_per_trade` · `expectancy` · `payoff_ratio` · `breakeven_wr` · `profit_factor` · `avg_win_r` / `avg_loss_r` · `avg_mfe_r` / `avg_mae_r` · `max_dd_r` · `z_score` · `fill_rate` (limit mode). For TOP3: `max_concurrent` / `avg_concurrent` / `concurrent_dist`.
 
-**Breakdowns per config:** Category · Status · MACD · Direction · ChoCH Age · Entry Extension · Entry Mode · TFS bucket · TFS Verdict · **Wyckoff Cause Score** · **Base Strength** · **Range Duration** · **Phase D Age**
+**Breakdowns per config:** Category · Status · MACD · Direction · ChoCH Age · Entry Extension · Entry Mode · TFS bucket · TFS Verdict · **Wyckoff Cause Score** · **Base Strength** · **Range Duration** · **Phase D Age** · **Setup Family** · **Setup Variant** · **Trend Conflict**
 
 **Edge diagnostics:** `_edge_groups()` scans all breakdown rows across all configs — reports EDGE CANDIDATES (N≥20, EV>0, PF>1.2) and EDGE KILLERS (N≥20, EV<0, PF<1.0).
 
 **Output:**
-- HTML: `strategy_wyckoff_9_5/results/backtest_{start}_{end}_{fuel_ON|fuel_OFF}.html`
-- CSV: `strategy_wyckoff_9_5/results/backtest_{start}_{end}_{fuel_ON|fuel_OFF}_trades.csv` — one row per trade, all configs stacked. Columns include all trade fields plus Wyckoff Cause fields.
+- HTML: `strategy_wyckoff_9_5/results/backtest_{start}_{end}_{fuel_ON|fuel_OFF}_{ENGINE}[{dedup_label}].html`
+- CSV: same basename `_trades.csv` — one row per trade, all configs stacked. Columns include all trade fields plus family fields (`setup_family`, `setup_variant`, `countertrend`, `trend_conflict`, `htf_context`, `recommended_tp_mode`, `family_reason`, `family_risk`).
 
 **Debug mode:** first `run_config()` call uses `debug_wcs=True`, printing up to 5 setups with Wyckoff Cause diagnostics to stdout for sanity-checking.
-
-**TF fetched:** `BT_TIMEFRAMES = ["1H", "30m", "15m", "5m"]`
 
 Raw data dicts include a `_turnover` float key — always filter with `isinstance(c, list)` when iterating `.items()` before passing to `slice_at()`. BTC and ETH always included for `st.market_regime()`.
 

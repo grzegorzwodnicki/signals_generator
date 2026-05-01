@@ -39,8 +39,8 @@ RESULTS_DIR = os.path.join(_THIS_DIR, "results")
 os.makedirs(CACHE_DIR,   exist_ok=True)
 os.makedirs(RESULTS_DIR, exist_ok=True)
 
-# 30m added for Wyckoff Phase D confirmation context
-BT_TIMEFRAMES = ["1H", "30m", "15m", "5m"]
+# 4H added for TREND_PULLBACK HTF trend detection (v9.5)
+BT_TIMEFRAMES = ["4H", "1H", "30m", "15m", "5m"]
 MAX_WORKERS   = 20
 RATE_SEM      = threading.Semaphore(20)
 
@@ -79,6 +79,10 @@ INTRABAR_MODES = {
     "conservative": True,
     "optimistic":   False,
 }
+
+# Engine selection: "v95" = multi-family (WYCKOFF_STRICT + TREND_PULLBACK)
+#                  "v94" = Wyckoff-only (original analyze_symbol)
+ENGINE = "v95"
 
 # CORE_V93 hard filter — strictest diagnostic subset
 def _passes_core_v93(setup):
@@ -201,6 +205,8 @@ _CAT_TIER = {"premium_setup": 4, "high_quality": 3, "secondary_quality": 2, "wat
 
 
 def _rank_key(s):
+    if ENGINE == "v95":
+        return st.rank_key_v95(s)
     return (
         s["mps"],
         s["ts"],
@@ -255,6 +261,14 @@ def _trade_record(top, step_dt, ts, next_ts, entry_mode):
         "choch_age":   top["choch_age"],
         "entry_ext":   top["entry_ext"],
         "pattern_type":             top.get("pattern_type", ""),
+        "setup_family":             top.get("setup_family", "WYCKOFF_STRICT"),
+        "setup_variant":            top.get("setup_variant"),
+        "countertrend":             top.get("countertrend", False),
+        "trend_conflict":           top.get("trend_conflict", False),
+        "htf_context":              top.get("htf_context"),
+        "recommended_tp_mode":      top.get("recommended_tp_mode"),
+        "family_reason":            top.get("family_reason"),
+        "family_risk":              top.get("family_risk"),
         "target_feasibility_score":        top.get("target_feasibility_score"),
         "verdict":                         top.get("verdict"),
         "wyckoff_cause_score":             top.get("wyckoff_cause_score"),
@@ -278,6 +292,10 @@ def run_config(
     raw_data, symbols, start_dt, end_dt, scan_interval_h,
     cfg_name, model_name, conservative=True, entry_mode="limit",
     debug_wcs=False,
+    cooldown_hours=0,
+    max_one_per_day=False,
+    enabled_families=None,
+    exclude_ob_only=False,
 ):
     cfg         = CONFIGS[cfg_name]
     sim_fn      = MODELS[model_name]
@@ -292,6 +310,7 @@ def run_config(
     pending_orders  = []
     trades          = []
     concurrent_hist = []
+    last_entry_by_sym = {}  # symbol -> datetime of last entry placed
 
     orders = {"created": 0, "filled": 0, "cancelled": 0}
 
@@ -377,16 +396,38 @@ def run_config(
         for sym in symbols:
             if sym in busy:
                 continue
+            # ── Cooldown dedup ──────────────────────────────────────
+            if cooldown_hours > 0:
+                last_entry = last_entry_by_sym.get(sym)
+                if last_entry and (step_dt - last_entry).total_seconds() < cooldown_hours * 3600:
+                    continue
+            if max_one_per_day:
+                last_entry = last_entry_by_sym.get(sym)
+                if last_entry and last_entry.date() == step_dt.date():
+                    continue
             data = build_symbol_data(raw_data, sym, ts)
             if not data["price"]:
                 continue
-            setup = st.analyze_symbol(sym, data, regime)
+            if ENGINE == "v95":
+                setup = st.analyze_symbol_v95(sym, data, regime)
+            else:
+                setup = st.analyze_symbol(sym, data, regime)
             if not setup:
                 continue
-            setup["ts"]       = st.total_score(setup)
-            setup["mps"]      = st.manual_pick_score(setup)
-            setup["category"] = st.classify(setup)
-            setup["model"]    = st.recommend_model(setup)
+            setup["ts"]  = st.total_score(setup)
+            setup["mps"] = st.manual_pick_score(setup)
+            if ENGINE == "v95":
+                setup["category"] = st.classify_v95(setup)
+                setup["model"]    = st.recommend_model_v95(setup)
+            else:
+                setup["category"] = st.classify(setup)
+                setup["model"]    = st.recommend_model(setup)
+            # ── Family + OB-only filters ─────────────────────────────
+            if enabled_families is not None and ENGINE == "v95":
+                if setup.get("setup_family") not in enabled_families:
+                    continue
+            if exclude_ob_only and setup.get("setup_variant", "").endswith("_OB"):
+                continue
             if debug_wcs and _wcs_printed < 5:
                 _wcs_printed += 1
                 print(
@@ -412,6 +453,7 @@ def run_config(
         for top in candidates:
             rec = _trade_record(top, step_dt, ts, next_ts, entry_mode)
             orders["created"] += 1
+            last_entry_by_sym[top["symbol"]] = step_dt
 
             if market_mode:
                 # Immediate fill at entry_mid (signal candle close)
@@ -852,6 +894,8 @@ _CSV_FIELDS = [
     "entry_mid", "sl", "tp2", "tp3", "rr", "risk",
     "category", "wyckoff", "status", "macd_5m",
     "choch_age", "entry_ext", "pattern_type",
+    "setup_family", "setup_variant", "countertrend", "trend_conflict",
+    "htf_context", "recommended_tp_mode",
     "mps", "ts_score",
     "target_feasibility_score", "verdict",
     "wyckoff_cause_score", "base_strength_label",
@@ -890,6 +934,12 @@ def _export_csv(config_results, path):
                 "choch_age":   t.get("choch_age"),
                 "entry_ext":   t.get("entry_ext"),
                 "pattern_type":             t.get("pattern_type"),
+                "setup_family":             t.get("setup_family", "WYCKOFF_STRICT"),
+                "setup_variant":            t.get("setup_variant"),
+                "countertrend":             t.get("countertrend", False),
+                "trend_conflict":           t.get("trend_conflict", False),
+                "htf_context":              t.get("htf_context"),
+                "recommended_tp_mode":      t.get("recommended_tp_mode"),
                 "mps":         t.get("mps"),
                 "ts_score":    t.get("ts_score"),
                 "target_feasibility_score": t.get("target_feasibility_score"),
@@ -934,7 +984,7 @@ def generate_report(config_results, meta):
     header = (
         f'<div style="background:#0d1520;border-bottom:2px solid #00ff8c;padding:20px 32px">'
         f'<div style="font-size:11px;color:#8899aa;letter-spacing:1px;margin-bottom:4px">'
-        f'BACKTEST REPORT — Crypto Wyckoff + SMC v9.1 strict</div>'
+        f'BACKTEST REPORT — Crypto Wyckoff + SMC v9.5 | Engine: {meta.get("engine","v95")}</div>'
         f'<h1 style="font-size:24px;color:#e6edf7;margin-bottom:6px">'
         f'{meta["start"]} → {meta["end"]}</h1>'
         f'<div style="font-size:12px;color:#8899aa">'
@@ -1023,6 +1073,9 @@ def generate_report(config_results, meta):
                 _stat_card("Steps 3 active", dist.get(3, 0))
             )
 
+        bd_family   = _breakdown(trades, lambda t: t.get("setup_family", "WYCKOFF_STRICT"))
+        bd_variant  = [r for r in _breakdown(trades, lambda t: t.get("setup_variant") or "N/A") if r["_n"] >= 3]
+        bd_tconfl   = _breakdown(trades, lambda t: "Conflict" if t.get("trend_conflict") else "No Conflict")
         bd_cat    = _breakdown(trades, lambda t: t.get("category",  "?"))
         bd_status = _breakdown(trades, lambda t: t.get("status",    "?"))
         bd_macd   = _breakdown(trades, lambda t: t.get("macd_5m",   "?"))
@@ -1051,6 +1104,9 @@ def generate_report(config_results, meta):
         bd_pd_age    = _breakdown(trades, lambda t: _bucket_phase_d_age(t.get("phase_d_age_bars")))
 
         bds_html = (
+            _breakdown_table(bd_family,   "By Setup Family") +
+            _breakdown_table(bd_variant,  "By Setup Variant (min 3 trades)") +
+            _breakdown_table(bd_tconfl,   "By Trend Conflict (1H vs 4H)") +
             _breakdown_table(bd_cat,      "By Category") +
             _breakdown_table(bd_status,   "By Status") +
             _breakdown_table(bd_macd,     "By MACD") +
@@ -1069,6 +1125,8 @@ def generate_report(config_results, meta):
         # Accumulate for global edge section
         run_tag = f"{cfg}/{model}/{cons_label}/{entry_mode}"
         for dim_label, rows in [
+            ("SetupFamily", bd_family), ("SetupVariant", bd_variant),
+            ("TrendConflict", bd_tconfl),
             ("Category", bd_cat), ("Status", bd_status), ("MACD", bd_macd),
             ("Direction", bd_dir), ("ChoCH", bd_choch), ("ExtBucket", bd_ext),
             ("EntryMode", bd_entry), ("TFS bucket", bd_tfs), ("TFS verdict", bd_verdict),
@@ -1124,7 +1182,7 @@ def generate_report(config_results, meta):
 
     return (
         f'<!DOCTYPE html><html lang="pl"><head><meta charset="UTF-8">'
-        f'<title>Backtest v9.1 — {meta["start"]} → {meta["end"]}</title>'
+        f'<title>Backtest v9.5 [{meta.get("engine","v95")}] — {meta["start"]} → {meta["end"]}</title>'
         f'<style>{css}</style></head><body>'
         f'{header}'
         f'<div style="padding:20px 32px">{comparison}</div>'
@@ -1146,11 +1204,12 @@ def main():
     fuel_label = "fuel_ON" if st.USE_TARGET_FEASIBILITY_FILTER else "fuel_OFF"
 
     print("=" * 60)
-    print("  Backtest v9.1 strict")
-    print("  Configs: TOP1 / TOP3 / PREMIUM / HQ / PREMIUM_HQ")
-    print("  Models:  A / B / Auto")
+    print(f"  Backtest v9.5 — Engine: {ENGINE}")
+    print("  Configs: TOP1 / TOP3 / PREMIUM / HQ / PREMIUM_HQ / CORE_V93")
+    print("  Models:  A / B / Auto / FIXED_2R")
     print("  Modes:   conservative / optimistic")
     print(f"  Fuel Filter (TFS): {'ON' if st.USE_TARGET_FEASIBILITY_FILTER else 'OFF'}")
+    print(f"  Families: {'WYCKOFF_STRICT + TREND_PULLBACK' if ENGINE == 'v95' else 'WYCKOFF_STRICT only'}")
     print("=" * 60)
 
     start_str = input("\nData START (dd/mm/yyyy hh:mm): ").strip()
@@ -1204,6 +1263,26 @@ def main():
     else:
         chosen_entries = ["limit"]
 
+    # ── Dedup / cooldown options ─────────────────────────────────────
+    cooldown_str = input("\nCooldown per symbol in hours (Enter = 0 = off): ").strip()
+    cooldown_hours = int(cooldown_str) if cooldown_str.isdigit() else 0
+
+    max_one_day_str = input("Max one trade per symbol per day? (y/N): ").strip().lower()
+    max_one_per_day = max_one_day_str == "y"
+
+    if ENGINE == "v95":
+        print("Families available: WYCKOFF_STRICT, TREND_PULLBACK")
+        fam_input = input("Filter families (Enter = all, e.g. TREND_PULLBACK): ").strip()
+        if fam_input:
+            enabled_families = {f.strip() for f in fam_input.split(",") if f.strip()}
+        else:
+            enabled_families = None
+    else:
+        enabled_families = None
+
+    excl_ob_str = input("Exclude OB-only setups (setup_variant ends with _OB)? (y/N): ").strip().lower()
+    exclude_ob_only = excl_ob_str == "y"
+
     start_ms = int(start_dt.timestamp() * 1000)
     end_ms   = int(end_dt.timestamp()   * 1000)
 
@@ -1213,6 +1292,7 @@ def main():
     print(f"Modele:       {chosen_models}")
     print(f"Tryby:        {[c for c, _ in chosen_cons]}")
     print(f"Entry:        {chosen_entries}")
+    print(f"Cooldown:     {cooldown_hours}h | Max1/day: {max_one_per_day} | Families: {enabled_families or 'all'} | ExclOB: {exclude_ob_only}")
 
     print("\n[1/3] Pobieranie listy top symboli...")
     top_crypto = st.get_top_crypto(n_sym)
@@ -1228,7 +1308,8 @@ def main():
 
     start_tag  = start_dt.strftime("%Y%m%d%H%M")
     end_tag    = end_dt.strftime("%Y%m%d%H%M")
-    cache_file = os.path.join(CACHE_DIR, f"bt_{start_tag}_{end_tag}_top{n_sym}.json")
+    tf_suffix  = "4H1H30m15m5m" if "4H" in BT_TIMEFRAMES else "1H30m15m5m"
+    cache_file = os.path.join(CACHE_DIR, f"bt_{start_tag}_{end_tag}_top{n_sym}_{tf_suffix}.json")
 
     print(f"\n[2/3] Dane OHLCV — TF: {BT_TIMEFRAMES}")
     print(f"      Cache: {os.path.basename(cache_file)}")
@@ -1254,6 +1335,10 @@ def main():
                         raw_data, symbols, start_dt, end_dt, scan_h,
                         cfg_name, model_name, cons_val, entry_mode,
                         debug_wcs=_first_run,
+                        cooldown_hours=cooldown_hours,
+                        max_one_per_day=max_one_per_day,
+                        enabled_families=enabled_families,
+                        exclude_ob_only=exclude_ob_only,
                     )
                     _first_run = False
                     stats = compute_stats(
@@ -1275,22 +1360,40 @@ def main():
                     )
 
     report_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # Build dedup label for filename
+    dedup_parts = []
+    if cooldown_hours > 0:
+        dedup_parts.append(f"cd{cooldown_hours}h")
+    if max_one_per_day:
+        dedup_parts.append("1perday")
+    if enabled_families:
+        short = "_".join(f[:2] for f in sorted(enabled_families))
+        dedup_parts.append(f"fam{short}")
+    if exclude_ob_only:
+        dedup_parts.append("noOB")
+    dedup_label = ("_" + "_".join(dedup_parts)) if dedup_parts else ""
+
     meta = {
-        "start":           start_dt.strftime("%Y-%m-%d %H:%M"),
-        "end":             end_dt.strftime("%Y-%m-%d %H:%M"),
-        "scan_interval_h": scan_h,
-        "n_symbols":       len(symbols),
-        "report_time":     report_time,
-        "fuel_label":      fuel_label,
+        "start":            start_dt.strftime("%Y-%m-%d %H:%M"),
+        "end":              end_dt.strftime("%Y-%m-%d %H:%M"),
+        "scan_interval_h":  scan_h,
+        "n_symbols":        len(symbols),
+        "report_time":      report_time,
+        "fuel_label":       fuel_label,
+        "engine":           ENGINE,
+        "cooldown_hours":   cooldown_hours,
+        "max_one_per_day":  max_one_per_day,
+        "enabled_families": list(enabled_families) if enabled_families else "all",
+        "exclude_ob_only":  exclude_ob_only,
     }
 
     html    = generate_report(config_results, meta)
-    outfile = os.path.join(RESULTS_DIR, f"backtest_{start_tag}_{end_tag}_{fuel_label}.html")
+    outfile = os.path.join(RESULTS_DIR, f"backtest_{start_tag}_{end_tag}_{fuel_label}_{ENGINE}{dedup_label}.html")
     with open(outfile, "w", encoding="utf-8") as f:
         f.write(html)
     print(f"\n✅ Raport: {outfile}")
 
-    csv_file = os.path.join(RESULTS_DIR, f"backtest_{start_tag}_{end_tag}_{fuel_label}_trades.csv")
+    csv_file = os.path.join(RESULTS_DIR, f"backtest_{start_tag}_{end_tag}_{fuel_label}_{ENGINE}{dedup_label}_trades.csv")
     n_rows = _export_csv(config_results, csv_file)
     print(f"✅ CSV:   {csv_file}  ({n_rows} wierszy)")
 

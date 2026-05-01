@@ -1269,3 +1269,366 @@ def recommend_model(s):
         return "Model A"
 
     return "Model B"
+
+
+# ============================================================
+# v9.5 — SETUP FAMILY FRAMEWORK
+# ============================================================
+
+_WYCKOFF_CAUSE_EMPTY = {
+    "wyckoff_cause_score":             0,
+    "base_strength_label":             "UNKNOWN_BASE",
+    "range_duration_bars_1h":          None,
+    "range_duration_hours":            None,
+    "range_width_percent":             None,
+    "range_atr_ratio":                 None,
+    "range_compression_score":         0,
+    "sos_sow_displacement_atr":        None,
+    "sos_sow_volume_ratio":            None,
+    "phase_d_age_bars":                None,
+    "pullback_depth_percent_of_range": None,
+    "pullback_hold_score":             0,
+    "wyckoff_cause_note":              "N/A (non-Wyckoff family)",
+}
+
+
+def detect_trend_pullback(symbol, data, regime):
+    """Detect TREND_PULLBACK setups — HTF trend + LTF demand/supply pullback."""
+    candles_1h  = data["timeframes"].get("1H",  [])
+    candles_4h  = data["timeframes"].get("4H",  [])
+    candles_15m = data["timeframes"].get("15m", [])
+    candles_5m  = data["timeframes"].get("5m",  [])
+    price       = data.get("price", 0)
+    turnover    = data.get("turnover", 0)
+
+    if len(candles_5m) < 30 or len(candles_1h) < 20:
+        return None
+    if turnover > 0 and turnover < 800_000:
+        return None
+
+    trend_1h = _trend(candles_1h)
+    trend_4h = _trend(candles_4h) if len(candles_4h) >= 20 else "neutral"
+
+    if trend_1h == "bullish" or trend_4h == "bullish":
+        direction = "LONG"
+    elif trend_1h == "bearish" or trend_4h == "bearish":
+        direction = "SHORT"
+    else:
+        return None
+
+    fvg = detect_fvg(candles_5m, direction)
+    ob  = detect_ob(candles_5m, direction)
+    if not fvg and not ob:
+        return None
+
+    choch = detect_choch(candles_5m, direction)
+    if not choch or not choch.get("confirmed") or choch["candles_ago"] > 3:
+        return None
+    choch_age = choch["candles_ago"]
+
+    engulf = detect_engulfing(candles_5m, direction)
+    pin    = detect_pin_bar(candles_5m, direction)
+    if engulf:
+        pattern = engulf
+    elif pin:
+        pattern = pin
+    else:
+        return None
+
+    m5 = macd_divergence(candles_5m, direction)
+    if m5 == "against":
+        return None
+    m15 = macd_divergence(candles_15m, direction) if candles_15m else "none"
+
+    # Build entry from FVG / OB
+    status    = "no_entry"
+    entry_mid = price
+    sl        = None
+
+    if fvg and not fvg["filled"]:
+        entry_mid = fvg["mid"]
+        sl        = fvg["fvg_low"] * 0.990 if direction == "LONG" else fvg["fvg_high"] * 1.010
+        status    = "at_fvg"
+        if ob:
+            ov_lo = max(fvg["fvg_low"], ob["ob_low"])
+            ov_hi = min(fvg["fvg_high"], ob["ob_high"])
+            if ov_hi > ov_lo:
+                status = "at_fvg_and_order_block"
+    elif ob:
+        entry_mid = ob["mid"]
+        sl        = ob["ob_low"] * 0.990 if direction == "LONG" else ob["ob_high"] * 1.010
+        status    = "at_order_block"
+    else:
+        return None
+
+    if sl is None or sl <= 0:
+        return None
+    risk = abs(entry_mid - sl)
+    if risk <= 0:
+        return None
+
+    sign = 1 if direction == "LONG" else -1
+    tp1a = entry_mid + sign * 1.1 * risk
+    tp1b = entry_mid + sign * 1.5 * risk
+    tp2  = entry_mid + sign * 2.0 * risk
+    tp3  = entry_mid + sign * 3.0 * risk
+    rr   = 2.0
+
+    pc          = pattern.get("candle", {})
+    touches_fvg = bool(fvg and pc and pc.get("low",0) <= fvg["fvg_high"] and pc.get("high",0) >= fvg["fvg_low"])
+    touches_ob  = bool(ob  and pc and pc.get("low",0) <= ob["ob_high"]   and pc.get("high",0) >= ob["ob_low"])
+
+    avg_vol   = sum(c["volume"] for c in candles_5m[-20:]) / 20 if len(candles_5m) >= 20 else 0
+    vol_bonus = bool(pc and pc.get("volume", 0) > avg_vol * 1.2)
+
+    if direction == "LONG":
+        aligned = True if regime == "bullish" else (False if regime == "bearish" else None)
+    else:
+        aligned = True if regime == "bearish" else (False if regime == "bullish" else None)
+
+    # Proxy Wyckoff range from recent 1H price action
+    recent_1h = candles_1h[-20:]
+    rh  = max(c["high"] for c in recent_1h)
+    rl  = min(c["low"]  for c in recent_1h)
+    rng = rh - rl
+
+    if rng > 0:
+        entry_ext = max((entry_mid - rh) / rng if direction == "LONG" else (rl - entry_mid) / rng, 0.0)
+    else:
+        entry_ext = 0.0
+
+    if entry_ext > 0.50:
+        return None
+
+    htf_label    = f"1H:{trend_1h}" + (f" 4H:{trend_4h}" if trend_4h != "neutral" else "")
+    loc_label    = ("FVG+OB" if status == "at_fvg_and_order_block" else
+                    "FVG"    if "fvg" in status else "OB")
+    zone_type    = "DEMAND" if direction == "LONG" else "SUPPLY"
+
+    trend_conflict = (
+        trend_1h != "neutral"
+        and trend_4h != "neutral"
+        and trend_1h != trend_4h
+    )
+
+    family_risk = "Trend pullback risk: continuation may fail"
+    if trend_conflict:
+        family_risk += "; 1H/4H trend conflict"
+
+    setup = {
+        "symbol":       symbol,
+        "direction":    direction,
+        "setup_family": "TREND_PULLBACK",
+        "setup_variant": f"HTF_{direction}_{zone_type}_PULLBACK_{loc_label}",
+        "countertrend": False,
+        "htf_context":  htf_label,
+        "trend_conflict": trend_conflict,
+        "trend_1h":     trend_1h,
+        "trend_4h":     trend_4h,
+        "wyckoff": {
+            "pattern":      f"HTF {'Bullish' if direction=='LONG' else 'Bearish'}",
+            "direction":    direction,
+            "event":        "TREND",
+            "range_high":   rh,
+            "range_low":    rl,
+            "range_height": rng,
+            "phase_d":      True,
+            "pullback":     True,
+        },
+        "fvg":          fvg,
+        "ob":           ob,
+        "choch":        choch,
+        "choch_age":    choch_age,
+        "pattern_type": pattern["type"],
+        "pattern":      pattern,
+        "touches_fvg":  touches_fvg,
+        "touches_ob":   touches_ob,
+        "macd_5m":      m5,
+        "macd_15m":     m15,
+        "status":       status,
+        "entry_mid":    entry_mid,
+        "sl":           sl,
+        "tp1a":         tp1a,
+        "tp1b":         tp1b,
+        "tp2":          tp2,
+        "tp3":          tp3,
+        "rr":           rr,
+        "risk":         risk,
+        "entry_ext":    entry_ext,
+        "regime":       regime,
+        "aligned":      aligned,
+        "vol_bonus":    vol_bonus,
+        "avg_vol_5m":   avg_vol,
+        "price":        price,
+        "turnover":     turnover,
+        "recommended_tp_mode": "FIXED_2R",
+        "family_reason": f"HTF {direction} ({htf_label}) pullback to {loc_label}, ChoCH {choch_age}c",
+        "family_risk":   family_risk,
+    }
+
+    # Wyckoff cause N/A for non-Wyckoff family
+    setup.update(_WYCKOFF_CAUSE_EMPTY)
+    # TFS works normally
+    setup.update(compute_target_feasibility(setup, candles_5m))
+
+    if setup.get("target_feasibility_score", 0) < 50:
+        return None
+
+    return setup
+
+
+def analyze_symbol_v95(symbol, data, regime):
+    """
+    v9.5 multi-family analyzer. Returns the best single setup for this symbol.
+
+    Families currently supported:
+    - WYCKOFF_STRICT
+    - TREND_PULLBACK
+
+    Scores and classifies ALL candidates before selection so that an active
+    TREND_PULLBACK is never hidden by a watchlist/rejected WYCKOFF_STRICT.
+    """
+    candidates = []
+
+    # ── 1. WYCKOFF_STRICT ────────────────────────────────────────
+    ws = analyze_symbol(symbol, data, regime)
+    if ws:
+        ws["setup_family"]        = "WYCKOFF_STRICT"
+        ws["setup_variant"]       = ws.get("status", "wyckoff")
+        ws["countertrend"]        = False
+        ws["trend_conflict"]      = False
+        ws["htf_context"]         = ws["wyckoff"]["pattern"]
+        ws["recommended_tp_mode"] = "MODEL_A"
+        ws["family_reason"]       = (
+            f"Wyckoff {ws['wyckoff']['pattern']} Phase D, "
+            f"{ws['status'].replace('_', ' ')}, ChoCH {ws['choch_age']}c"
+        )
+        ws["family_risk"] = "Phase D failure / pullback through range"
+        candidates.append(ws)
+
+    # ── 2. TREND_PULLBACK ─────────────────────────────────────────
+    tp = detect_trend_pullback(symbol, data, regime)
+    if tp:
+        candidates.append(tp)
+
+    if not candidates:
+        return None
+
+    # ── 3. Score and classify EVERY candidate before selection ────
+    _active_cats = {"premium_setup", "high_quality", "secondary_quality"}
+    _family_prio = {
+        "WYCKOFF_STRICT":           5,
+        "LIQUIDITY_SWEEP_REVERSAL": 4,
+        "TREND_PULLBACK":           3,
+        "POC_MEAN_REVERSION":       2,
+        "COUNTERTREND_ABC":         1,
+    }
+
+    for s in candidates:
+        s["ts"]       = total_score(s)
+        s["mps"]      = manual_pick_score(s)
+        s["category"] = classify_v95(s)
+        s["model"]    = recommend_model_v95(s)
+
+    def _rank(s):
+        return (
+            1 if s.get("category") in _active_cats else 0,
+            s.get("mps", 0),
+            s.get("target_feasibility_score", 0),
+            _family_prio.get(s.get("setup_family"), 0),
+            1 if s.get("verdict") in ("CLEAN PATH", "TARGET POSSIBLE") else 0,
+            s.get("ts", 0),
+            -s.get("entry_ext", 1.0),
+        )
+
+    candidates.sort(key=_rank, reverse=True)
+    return candidates[0]
+
+
+def classify_v95(s):
+    """v9.5 classifier. Dispatches to family-specific rules."""
+    family    = s.get("setup_family", "WYCKOFF_STRICT")
+    macd      = s.get("macd_5m", "none")
+    entry_ext = s.get("entry_ext", 1.0)
+    fvg       = s.get("fvg")
+    tfs       = s.get("target_feasibility_score", 0)
+    choch_age = s.get("choch_age", 999)
+    verdict   = s.get("verdict", "")
+    rr        = s.get("rr", 0)
+    status    = s.get("status", "")
+
+    if family == "WYCKOFF_STRICT":
+        return classify(s)
+
+    # Common hard rejects
+    if macd == "against":
+        return "rejected"
+    if entry_ext > 0.50:
+        return "rejected"
+    if fvg and fvg.get("filled") and "fvg" in status:
+        return "rejected"
+    if verdict == "NO FUEL":
+        return "rejected"
+
+    if family == "TREND_PULLBACK":
+        valid = status in {"at_fvg", "at_order_block", "at_fvg_and_order_block"}
+        if (
+            tfs >= 50
+            and choch_age <= 3
+            and valid
+            and rr >= 1.5
+            and verdict not in {"TARGET BLOCKED", "TARGET_BLOCKED"}
+        ):
+            mps = s.get("mps", 0)
+            ts  = s.get("ts", 0)
+            if mps >= 75:
+                return "premium_setup"
+            if ts >= 73:
+                return "high_quality"
+            return "secondary_quality"
+        return "watchlist"
+
+    return "watchlist"
+
+
+def rank_key_v95(s):
+    _prio = {
+        "WYCKOFF_STRICT":          5,
+        "LIQUIDITY_SWEEP_REVERSAL":4,
+        "TREND_PULLBACK":          3,
+        "POC_MEAN_REVERSION":      2,
+        "COUNTERTREND_ABC":        1,
+    }
+    return (
+        s.get("mps", 0),
+        s.get("target_feasibility_score", 0),
+        _prio.get(s.get("setup_family"), 0),
+        1 if s.get("verdict") in ("CLEAN PATH", "TARGET POSSIBLE") else 0,
+        s.get("ts", 0),
+        -s.get("entry_ext", 1.0),
+    )
+
+
+def recommend_model_v95(s):
+    """v9.5 model recommendation. Family-aware."""
+    family  = s.get("setup_family", "WYCKOFF_STRICT")
+    tfs     = s.get("target_feasibility_score", 0)
+    verdict = s.get("verdict", "")
+
+    if family == "WYCKOFF_STRICT":
+        return recommend_model(s)
+
+    if family == "TREND_PULLBACK":
+        if tfs >= 65 and verdict in ("CLEAN PATH", "TARGET POSSIBLE"):
+            return "Model A"
+        return "Model B"
+
+    if family in ("COUNTERTREND_ABC", "POC_MEAN_REVERSION"):
+        return "Model B"
+
+    if family == "LIQUIDITY_SWEEP_REVERSAL":
+        if tfs >= 70 and verdict in ("CLEAN PATH", "TARGET POSSIBLE"):
+            return "Model A"
+        return "Model B"
+
+    return "Model B"

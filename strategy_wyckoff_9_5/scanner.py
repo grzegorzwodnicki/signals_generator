@@ -8,11 +8,14 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import csv
+import json
 import subprocess
 import time
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import strategy as st
+import config as cfg
 
 _THIS_DIR  = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(_THIS_DIR, "output")
@@ -83,6 +86,17 @@ def _base_badge(v):
     col, txt = m.get(v, ("#556677", "#fff"))
     return _badge((v or "UNKNOWN_BASE").replace("_", " "), col, txt)
 
+def _family_badge(f):
+    m = {
+        "WYCKOFF_STRICT":           ("#00ff8c", "#000"),
+        "TREND_PULLBACK":           ("#00e5ff", "#000"),
+        "LIQUIDITY_SWEEP_REVERSAL": ("#ffd700", "#000"),
+        "POC_MEAN_REVERSION":       ("#88ccff", "#000"),
+        "COUNTERTREND_ABC":         ("#ff8844", "#000"),
+    }
+    col, txt = m.get(f, ("#556677", "#fff"))
+    return _badge((f or "UNKNOWN").replace("_", " "), col, txt)
+
 def _dir_span(d):
     color = "#00ff8c" if d == "LONG" else "#ff4d4d"
     return f'<span style="color:{color};font-weight:bold">{d}</span>'
@@ -147,6 +161,26 @@ def render_model_a_plan(s):
         _row("Why Model A", "Best v9.5 backtest profile: higher WR, PF, lower DD")
     )
 
+def render_family_panel(s):
+    family  = s.get("setup_family", "WYCKOFF_STRICT")
+    variant = s.get("setup_variant", "–")
+    ct      = s.get("countertrend", False)
+    htf     = s.get("htf_context", "–")
+    tp_mode = s.get("recommended_tp_mode", "–")
+    reason  = s.get("family_reason", "–")
+    risk    = s.get("family_risk", "–")
+    return _panel("🏷 Setup Family Logic",
+        _row("Family",       _family_badge(family)) +
+        _row("Variant",      f'<span style="font-size:11px">{variant}</span>') +
+        _row("Countertrend", "⚠ YES" if ct else "NO") +
+        _row("Trend Conflict","⚠ YES" if s.get("trend_conflict") else "NO") +
+        _row("HTF Context",  htf) +
+        _row("LTF Trigger",  s.get("status", "–").replace("_", " ")) +
+        _row("Target Mode",  tp_mode) +
+        _row("Why applied",  f'<span style="font-size:11px;color:#aaffcc">{reason}</span>') +
+        _row("Family risk",  f'<span style="font-size:11px;color:#ffcc88">{risk}</span>')
+    )
+
 # ============================================================
 # KARTY SETUPÓW
 # ============================================================
@@ -208,7 +242,7 @@ def render_card(s):
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:8px">
     <div>
       <span style="font-size:20px;font-weight:bold;margin-right:8px">{sym}</span>
-      {_dir_span(d)} {_cat_badge(cat)} {_status_badge(s["status"])} {_macd_badge(s["macd_5m"])}
+      {_dir_span(d)} {_cat_badge(cat)} {_family_badge(s.get("setup_family","WYCKOFF_STRICT"))} {_status_badge(s["status"])} {_macd_badge(s["macd_5m"])}
       {_verdict_badge(s.get("verdict",""))} {_base_badge(s.get("base_strength_label","UNKNOWN_BASE"))}
     </div>
     <div style="text-align:right">
@@ -253,6 +287,7 @@ def render_card(s):
     </div>
     <div>
       {render_target_panel(s)}
+      {render_family_panel(s)}
       {_panel("📊 Manual Pick Score", mps_html +
         f'<div style="display:flex;justify-content:space-between;margin-top:8px">'
         f'<span style="font-weight:bold">TOTAL</span>'
@@ -381,6 +416,15 @@ def render_top_pick(s, rank):
       _row("WCS",        f'{s.get("wyckoff_cause_score","N/A")}/15') +
       _row("Model",      model)
     )}
+    {_panel("🏷 Family",
+      _row("Family",     _family_badge(s.get("setup_family","WYCKOFF_STRICT"))) +
+      _row("Variant",    f'<span style="font-size:11px">{s.get("setup_variant","–")}</span>') +
+      _row("Countertrend","⚠ YES" if s.get("countertrend") else "NO") +
+      _row("HTF Context",s.get("htf_context","–")) +
+      _row("Target Mode",s.get("recommended_tp_mode","–")) +
+      _row("Why",        f'<span style="font-size:11px;color:#aaffcc">{s.get("family_reason","–")}</span>') +
+      _row("Risk",       f'<span style="font-size:11px;color:#ffcc88">{s.get("family_risk","–")}</span>')
+    )}
     {_panel("✅ Why TOP PICK",
       "".join(f'<div style="color:#00ff8c;padding:2px 0;font-size:13px">✓ {r}</div>' for r in reasons) +
       "<div style='margin-top:8px;font-size:12px;color:#8899aa;font-weight:bold'>Main Risk</div>" +
@@ -400,10 +444,15 @@ def render_table(setups):
         tfc  = ("#00ff8c" if (tfs or 0) >= 70 else
                 "#ffd700" if (tfs or 0) >= 55 else
                 "#ff8844" if (tfs or 0) >= 40 else "#ff4d4d")
+        family = s.get("setup_family", "WYCKOFF_STRICT")
+        fc     = {"WYCKOFF_STRICT":"#00ff8c","TREND_PULLBACK":"#00e5ff",
+                  "LIQUIDITY_SWEEP_REVERSAL":"#ffd700","POC_MEAN_REVERSION":"#88ccff",
+                  "COUNTERTREND_ABC":"#ff8844"}.get(family, "#888")
         rows += f"""<tr>
           <td>{i}</td>
           <td style="font-weight:bold">{s["symbol"]}</td>
           <td style="color:{dc}">{d}</td>
+          <td style="color:{fc};font-size:11px">{family.replace("_"," ")}</td>
           <td>{s["wyckoff"]["pattern"]}</td>
           <td>{s.get("category","").replace("_"," ").title()}</td>
           <td style="color:#00ff8c;font-weight:bold">{s["mps"]}</td>
@@ -433,7 +482,7 @@ def render_table(setups):
       <thead style="background:#0d1520;color:#8899aa">
         <tr>
           <th style="padding:8px 6px;text-align:left">#</th>
-          <th>Symbol</th><th>Dir</th><th>Wyckoff</th><th>Category</th>
+          <th>Symbol</th><th>Dir</th><th>Family</th><th>Wyckoff</th><th>Category</th>
           <th>MPS</th><th>Score</th>
           <th>TFS</th><th>Verdict</th><th>WCS</th><th>Base</th><th>Obstacle</th><th>Magnet</th>
           <th>Status</th><th>Pattern</th><th>ChoCH</th>
@@ -446,47 +495,300 @@ def render_table(setups):
     </table></div>"""
 
 # ============================================================
+# MANAGEMENT NOTE (family-aware)
+# ============================================================
+
+def _management_note(s):
+    fam     = s.get("setup_family", "WYCKOFF_STRICT")
+    tfs     = s.get("target_feasibility_score", 0)
+    verdict = s.get("verdict", "")
+    if fam == "WYCKOFF_STRICT":
+        return "Default: Model A. Runner allowed if clean target."
+    if fam == "TREND_PULLBACK":
+        if tfs >= 70 and verdict in ("CLEAN PATH", "TARGET POSSIBLE"):
+            return "Strong trend pullback: Model B default, FIXED_2R optional manually."
+        return "Trend pullback: Model B / 1.5R–2R preferred. No default 3R runner."
+    return "Use defensive Model B unless manually confirmed."
+
+
+def _entry_price(s):
+    return s.get("entry_mid") or s.get("entry")
+
+
+# ============================================================
+# WATCHLIST FUEL CANDIDATES
+# ============================================================
+
+def _watchlist_fuel_rank(s):
+    return (
+        s.get("target_feasibility_score", 0),
+        s.get("mps", 0),
+        s.get("ts", 0),
+        1 if s.get("verdict") in ("CLEAN PATH", "TARGET POSSIBLE", "TARGET DIFFICULT") else 0,
+        1 if s.get("status") in ("at_fvg", "at_order_block", "at_fvg_and_order_block") else 0,
+        -s.get("entry_ext", 1.0),
+    )
+
+
+def _is_fuel_candidate(s):
+    if s.get("category") != "watchlist":
+        return False
+    if s.get("macd_5m") == "against":
+        return False
+    if s.get("verdict") == "NO FUEL":
+        return False
+    if s.get("entry_ext", 1.0) > 0.50:
+        return False
+    if s.get("rr", 0) < 1.2:
+        return False
+    if s.get("choch_age", 999) > 4:
+        return False
+    if (s.get("fvg") or {}).get("filled"):
+        return False
+    return True
+
+
+def _missing_reasons(s):
+    reasons = []
+    if s.get("target_feasibility_score", 0) < 55:
+        reasons.append(f'TFS only {s.get("target_feasibility_score","N/A")}/100')
+    if s.get("verdict") in ("TARGET DIFFICULT", "TARGET BLOCKED", "NO FUEL"):
+        reasons.append(f'Target verdict: {s.get("verdict")}')
+    if s.get("choch_age", 999) > 2:
+        reasons.append(f'ChoCH age {s.get("choch_age")}c')
+    if s.get("entry_ext", 0) > 0.25:
+        reasons.append(f'Entry extension {_pct(s.get("entry_ext"))}')
+    if s.get("status") == "confluence_zone":
+        reasons.append("Confluence only — no direct FVG/OB entry status")
+    if s.get("macd_5m") == "none":
+        reasons.append("MACD neutral / no divergence")
+    if not s.get("touches_fvg") and not s.get("touches_ob"):
+        reasons.append("Pattern does not touch FVG/OB")
+    if s.get("rr", 0) < 2.0:
+        reasons.append(f'R:R only {s.get("rr",0):.2f}R')
+    if (s.get("fvg") or {}).get("filled"):
+        reasons.append("FVG filled")
+    if not reasons:
+        reasons.append("Manual review required — software classified as watchlist")
+    return reasons
+
+
+def _manual_confirmations_needed(s):
+    checks = []
+    if s.get("target_feasibility_score", 0) < 55:
+        checks.append("Confirm manually that target path is clear enough")
+    if s.get("verdict") == "TARGET BLOCKED":
+        checks.append("Check if obstacle was already broken or reduce TP target")
+    if s.get("verdict") == "TARGET DIFFICULT":
+        checks.append("Consider lower TP: 1.2R–1.5R or POC target")
+    if s.get("choch_age", 999) > 2:
+        checks.append("Confirm price has not moved too far from entry zone")
+    if s.get("entry_ext", 0) > 0.25:
+        checks.append("Wait for better entry closer to FVG/OB")
+    if s.get("status") == "confluence_zone":
+        checks.append("Confirm real entry trigger at FVG/OB manually")
+    if s.get("macd_5m") == "none":
+        checks.append("Check momentum manually — MACD gives no confirmation")
+    if not s.get("touches_fvg") and not s.get("touches_ob"):
+        checks.append("Confirm pattern candle really reacts from the zone")
+    if not checks:
+        checks.append("Manual chart confirmation before entry")
+    return checks
+
+
+def render_fuel_candidate_card(s, rank):
+    pr       = s.get("price", 0)
+    tfs      = s.get("target_feasibility_score")
+    verdict  = s.get("verdict", "")
+    missing  = _missing_reasons(s)
+    checks   = _manual_confirmations_needed(s)
+    d_color  = "#00ff8c" if s.get("direction") == "LONG" else "#ff4d4d"
+    mgmt     = _management_note(s)
+
+    if (tfs or 0) >= 55 and verdict in ("CLEAN PATH", "TARGET POSSIBLE"):
+        mgmt_note = f"Model B default / FIXED_2R optional after manual confirmation. ({mgmt})"
+    elif verdict == "TARGET BLOCKED":
+        mgmt_note = "⚠ TARGET BLOCKED — use reduced TP (POC / nearest liquidity) or skip."
+    else:
+        mgmt_note = f"Model B / 1.5R–2R preferred. ({mgmt})"
+
+    missing_html = "".join(f'<li style="margin-bottom:3px;color:#ffcc88">{m}</li>' for m in missing)
+    checks_html  = "".join(f'<li style="margin-bottom:3px;color:#aaddff">□ {c}</li>' for c in checks)
+
+    blocked_bar = (
+        '<div style="margin-top:8px;background:#2a0a00;border-left:3px solid #ff8844;'
+        'padding:8px 10px;border-radius:0 4px 4px 0;font-size:12px;color:#ff8844">'
+        '⚠ TARGET BLOCKED — use reduced target or skip trade.</div>'
+    ) if verdict == "TARGET BLOCKED" else ""
+
+    return f"""
+<div style="background:#101827;border:1px solid #4488ff;border-radius:8px;padding:16px;margin-bottom:14px;box-shadow:0 0 10px rgba(68,136,255,0.15)">
+  <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap">
+    <div>
+      <div style="font-size:11px;color:#88ccff;font-weight:bold;letter-spacing:1px;margin-bottom:3px">
+        🔍 MANUAL REVIEW #{rank} — NOT ACTIVE
+      </div>
+      <div style="font-size:20px;font-weight:bold">
+        {s.get("symbol","?")} <span style="color:{d_color}">{s.get("direction","?")}</span>
+      </div>
+      <div style="margin-top:5px">
+        {_family_badge(s.get("setup_family","WYCKOFF_STRICT"))}
+        {_cat_badge(s.get("category","watchlist"))}
+        {_status_badge(s.get("status",""))}
+        {_macd_badge(s.get("macd_5m","none"))}
+        {_verdict_badge(verdict)}
+      </div>
+    </div>
+    <div style="text-align:right">
+      <div style="font-size:22px;color:#88ccff;font-weight:bold">{s.get("mps","N/A")}</div>
+      <div style="font-size:11px;color:#8899aa">MPS | Score: {s.get("ts","N/A")}</div>
+      <div style="font-size:12px;color:#ffd700;margin-top:3px">TFS: {tfs if tfs is not None else "N/A"}/100</div>
+    </div>
+  </div>
+  <div style="margin-top:10px;padding:8px 10px;background:#08111d;border-left:3px solid #4488ff;color:#cfe8ff;font-size:12px;border-radius:0 4px 4px 0">
+    <strong>⚠ NOT AN ACTIVE SIGNAL</strong> — Take only after confirming missing conditions on the chart.
+  </div>
+  {blocked_bar}
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-top:10px">
+    <div style="background:#0d1520;border-radius:6px;padding:10px">
+      <div style="color:#ffcc00;font-weight:bold;margin-bottom:6px;font-size:12px">⚠ Missing / Weak</div>
+      <ul style="padding-left:16px;margin:0;font-size:12px">{missing_html}</ul>
+    </div>
+    <div style="background:#0d1520;border-radius:6px;padding:10px">
+      <div style="color:#88ccff;font-weight:bold;margin-bottom:6px;font-size:12px">🔍 Manual Checks</div>
+      <ul style="padding-left:0;margin:0;list-style:none;font-size:12px">{checks_html}</ul>
+    </div>
+    <div style="background:#0d1520;border-radius:6px;padding:10px">
+      <div style="color:#00ffcc;font-weight:bold;margin-bottom:6px;font-size:12px">📌 Conditional Plan</div>
+      {_row("Entry",       _f(s.get("entry_mid"), pr))}
+      {_row("SL",          _f(s.get("sl"), pr), "#ff4d4d")}
+      {_row("TP1a (1.1R)", _f(s.get("tp1a"), pr))}
+      {_row("TP1b (2.0R)", _f(s.get("tp1b"), pr))}
+      {_row("TP2",         _f(s.get("tp2"), pr), "#00ff8c")}
+      {_row("R:R",         f'{s.get("rr",0):.2f}R')}
+      {_row("Management",  mgmt_note)}
+    </div>
+    <div style="background:#0d1520;border-radius:6px;padding:10px">
+      <div style="color:#00aaff;font-weight:bold;margin-bottom:6px;font-size:12px">🎯 Target / Fuel</div>
+      {_row("TFS",              f'{tfs if tfs is not None else "N/A"}/100')}
+      {_row("Verdict",          _verdict_badge(verdict))}
+      {_row("Nearest Obstacle", s.get("nearest_obstacle") or "–")}
+      {_row("Nearest Magnet",   s.get("nearest_magnet") or "–")}
+      {_row("WCS",              f'{s.get("wyckoff_cause_score","N/A")}/15')}
+    </div>
+  </div>
+</div>"""
+
+
+# ============================================================
+# ALERT COOLDOWN STATE
+# ============================================================
+
+_ALERT_STATE_FILE = os.path.join(_THIS_DIR, "output", "alert_state.json")
+
+
+def _load_alert_state():
+    if os.path.exists(_ALERT_STATE_FILE):
+        try:
+            with open(_ALERT_STATE_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_alert_state(state):
+    try:
+        with open(_ALERT_STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+    except Exception:
+        pass
+
+
+def _alert_key(s):
+    return f'{s.get("symbol")}_{s.get("direction")}_{s.get("setup_family","UNKNOWN")}'
+
+
+def _cooldown_status(s, state, now_dt, cooldown_hours):
+    """Returns 'NEW', 'SEEN', or 'COOLDOWN'."""
+    key = _alert_key(s)
+    if key not in state:
+        return "NEW"
+    last_str = state[key].get("last_seen", "")
+    try:
+        last_dt = datetime.strptime(last_str, "%Y-%m-%d %H:%M:%S")
+        hours   = (now_dt - last_dt).total_seconds() / 3600
+        return "NEW" if hours >= cooldown_hours else "COOLDOWN"
+    except Exception:
+        return "NEW"
+
+
+def _cooldown_badge(status):
+    if status == "NEW":
+        return _badge("🆕 NEW", "#00ff8c", "#000")
+    if status == "COOLDOWN":
+        return _badge("🔄 COOLDOWN", "#ffd700", "#000")
+    return _badge("SEEN", "#4488ff", "#fff")
+
+
+# ============================================================
 # RAPORT HTML
 # ============================================================
 
 def _live_rank_key(s):
-    return (
-        s.get("mps", 0),
-        s.get("target_feasibility_score", 0),
-        1 if s.get("verdict") in ("CLEAN PATH", "TARGET POSSIBLE") else 0,
-        1 if s.get("base_strength_label") in ("NORMAL_BASE", "STRONG_BASE", "VERY_STRONG_BASE") else 0,
-        1 if s.get("model") == "Model A" else 0,
-        s.get("ts", 0),
-        -s.get("entry_ext", 1.0),
-    )
+    return st.rank_key_v95(s)
 
-def generate_html(all_setups, meta):
+def generate_html(all_setups, meta, now_dt=None, alert_state=None):
+    if now_dt is None:
+        now_dt = datetime.now()
+    if alert_state is None:
+        alert_state = {}
+
     premium   = [s for s in all_setups if s.get("category") == "premium_setup"]
     hq        = [s for s in all_setups if s.get("category") == "high_quality"]
     sec       = [s for s in all_setups if s.get("category") == "secondary_quality"]
     watchlist = [s for s in all_setups if s.get("category") == "watchlist"]
     rejected  = [s for s in all_setups if s.get("category") == "rejected"]
 
-    active = sorted(premium + hq + sec, key=_live_rank_key, reverse=True)[:15]
+    active = sorted(premium + hq + sec, key=_live_rank_key, reverse=True)[:cfg.MAX_ACTIVE_SETUPS_HTML]
 
     top_picks = [
         s for s in active
         if s.get("mps", 0) >= 70
         and (s.get("target_feasibility_score") or 0) >= 55
         and s.get("verdict") not in ("TARGET BLOCKED", "NO FUEL")
-    ][:3]
+    ][:cfg.MAX_TOP_PICKS]
+
+    # Cooldown status for top picks
+    for s in top_picks:
+        s["_alert_status"] = _cooldown_status(s, alert_state, now_dt, cfg.ALERT_COOLDOWN_HOURS)
+
+    # Watchlist fuel candidates
+    fuel_candidates = sorted(
+        [s for s in watchlist if _is_fuel_candidate(s)],
+        key=_watchlist_fuel_rank, reverse=True
+    )[:cfg.MAX_WATCHLIST_REVIEW]
 
     regime = meta.get("regime", "unclear")
     rc     = {"bullish": "#00ff8c", "bearish": "#ff4d4d", "mixed": "#ffd700", "chop": "#88ccff"}.get(regime, "#888")
     rt_col = "#fff" if regime in ("bearish", "watchlist") else "#000"
+
+    all_active = premium + hq + sec  # for family counting (untruncated)
+    wyckoff_strict_n  = sum(1 for s in all_active if s.get("setup_family") == "WYCKOFF_STRICT")
+    trend_pb_n        = sum(1 for s in all_active if s.get("setup_family") == "TREND_PULLBACK")
+    other_family_n    = len(all_active) - wyckoff_strict_n - trend_pb_n
 
     stats_data = [
         ("Top Picks",       len(top_picks),  "#00ff8c"),
         ("Premium",         len(premium),    "#00ff8c"),
         ("High Quality",    len(hq),         "#00ffcc"),
         ("Secondary",       len(sec),        "#88ccff"),
-        ("Watchlist",       len(watchlist),  "#4488ff"),
-        ("Rejected",        len(rejected),   "#ff4d4d"),
+        ("Watchlist",        len(watchlist),          "#4488ff"),
+        ("WL Review",        len(fuel_candidates),    "#88ccff"),
+        ("Rejected",         len(rejected),           "#ff4d4d"),
+        ("Wyckoff Strict",   wyckoff_strict_n,        "#00ff8c"),
+        ("Trend Pullback",  trend_pb_n,      "#00e5ff"),
+        ("Other Family",    other_family_n,  "#88ccff"),
         ("Fuel ON",         "YES",           "#00ff8c"),
         ("TFS ≥ 70",        sum(1 for s in active if (s.get("target_feasibility_score") or 0) >= 70), "#00ff8c"),
         ("TFS 55–69",       sum(1 for s in active if 55 <= (s.get("target_feasibility_score") or 0) < 70), "#ffd700"),
@@ -510,15 +812,75 @@ def generate_html(all_setups, meta):
     )
 
     if top_picks:
-        picks_html = '<h3 style="color:#00ff8c;margin-bottom:12px">🏆 TOP 1 SETUP OF THE DAY</h3>' + render_top_pick(top_picks[0], 1)
+        top1_badge = _cooldown_badge(top_picks[0].get("_alert_status","NEW"))
+        picks_html = (
+            f'<h3 style="color:#00ff8c;margin-bottom:12px">🏆 TOP 1 SETUP OF THE DAY {top1_badge}</h3>'
+            + render_top_pick(top_picks[0], 1)
+        )
         if len(top_picks) > 1:
             picks_html += '<h3 style="color:#00ff8c;margin-bottom:12px;margin-top:20px">TOP 3 MANUAL PICKS</h3>'
             for i, p in enumerate(top_picks[1:], 2):
-                picks_html += render_top_pick(p, i)
+                badge = _cooldown_badge(p.get("_alert_status","NEW"))
+                picks_html += f'<div style="margin-bottom:4px">{badge}</div>' + render_top_pick(p, i)
     else:
         picks_html = '<div style="text-align:center;padding:40px;color:#556677;font-size:18px">⚠ No high-confidence manual trade today.</div>'
 
     cards_html = "".join(render_card(s) for s in active)
+
+    # Fuel candidates section
+    if cfg.ENABLE_WATCHLIST_REVIEW and fuel_candidates:
+        fc_cards = "".join(render_fuel_candidate_card(s, i + 1) for i, s in enumerate(fuel_candidates))
+        fuel_review_html = f"""
+<div style="padding:0 32px 24px">
+  <h2 style="color:#88ccff;border-bottom:1px solid #1e2d40;padding-bottom:8px;margin-bottom:14px">
+    🔍 Top Watchlist Fuel Candidates (Manual Review Only)
+  </h2>
+  <div style="background:#08111d;border-left:4px solid #4488ff;padding:10px 14px;margin-bottom:14px;color:#cfe8ff;font-size:13px;border-radius:0 6px 6px 0">
+    <strong>NOT active signals.</strong> Strongest watchlist setups for manual chart verification.
+    Take only after confirming missing condition — use reduced targets if target is blocked.
+  </div>
+  {fc_cards}
+</div>"""
+    else:
+        fuel_review_html = ""
+
+    # Family summary breakdown
+    _family_order = [
+        ("WYCKOFF_STRICT",           "#00ff8c", "#000"),
+        ("TREND_PULLBACK",           "#00e5ff", "#000"),
+        ("LIQUIDITY_SWEEP_REVERSAL", "#ffd700", "#000"),
+        ("POC_MEAN_REVERSION",       "#88ccff", "#000"),
+        ("COUNTERTREND_ABC",         "#ff8844", "#000"),
+    ]
+    family_rows = ""
+    for fam, bg, tc in _family_order:
+        fam_setups = [s for s in all_active if s.get("setup_family") == fam]
+        if not fam_setups:
+            continue
+        avg_tfs = sum(s.get("target_feasibility_score") or 0 for s in fam_setups) / len(fam_setups)
+        avg_mps = sum(s.get("mps", 0) for s in fam_setups) / len(fam_setups)
+        premium_n = sum(1 for s in fam_setups if s.get("category") == "premium_setup")
+        hq_n = sum(1 for s in fam_setups if s.get("category") == "high_quality")
+        family_rows += (
+            f'<tr>'
+            f'<td><span style="background:{bg};color:{tc};padding:2px 8px;border-radius:4px;font-size:11px;font-weight:bold">{fam.replace("_"," ")}</span></td>'
+            f'<td style="text-align:center">{len(fam_setups)}</td>'
+            f'<td style="text-align:center">{premium_n}</td>'
+            f'<td style="text-align:center">{hq_n}</td>'
+            f'<td style="text-align:center">{avg_tfs:.0f}</td>'
+            f'<td style="text-align:center">{avg_mps:.0f}</td>'
+            f'<td style="text-align:center">{", ".join(s["symbol"] for s in sorted(fam_setups, key=lambda x: x.get("mps",0), reverse=True)[:5])}</td>'
+            f'</tr>'
+        )
+    family_summary_html = (
+        f'<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:12px">'
+        f'<thead style="background:#0d1520;color:#8899aa">'
+        f'<tr><th style="padding:8px 6px;text-align:left">Family</th>'
+        f'<th>Active</th><th>Premium</th><th>HQ</th>'
+        f'<th>Avg TFS</th><th>Avg MPS</th><th>Top Symbols</th></tr></thead>'
+        f'<tbody>{family_rows}</tbody></table></div>'
+        if family_rows else "<p style='color:#556677'>No active setups by family.</p>"
+    )
 
     watchlist_rows = "".join(
         f'<tr><td style="font-weight:bold">{s["symbol"]}</td>'
@@ -568,18 +930,18 @@ def generate_html(all_setups, meta):
            "td{padding:7px 6px;border-bottom:1px solid #1a2535}"
            "tr:hover td{background:#0d1520}")
 
-    return f"""<!DOCTYPE html>
+    _html = f"""<!DOCTYPE html>
 <html lang="pl">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Crypto Wyckoff + SMC v9.5 — {meta.get("data_time","")}</title>
+  <title>Crypto Wyckoff + SMC {meta.get("scanner_version","v9.5")} — {meta.get("data_time","")}</title>
   <style>{css}</style>
 </head>
 <body>
 
 <div style="background:#0d1520;border-bottom:2px solid #00ff8c;padding:24px 32px">
-  <h1 style="font-size:22px;color:#00ff8c;margin-bottom:8px">📊 Crypto Wyckoff + SMC Scanner v9.5</h1>
+  <h1 style="font-size:22px;color:#00ff8c;margin-bottom:8px">📊 Crypto Wyckoff + SMC Scanner {meta.get("scanner_version","v9.5")}</h1>
   <div style="color:#8899aa;font-size:12px;margin-bottom:8px">
     Report: <strong>{meta.get("report_time","")}</strong> |
     Data: <strong>{meta.get("data_time","")}</strong> |
@@ -590,13 +952,13 @@ def generate_html(all_setups, meta):
     TOP picks: <strong>{len(top_picks)}</strong>
   </div>
   <div style="font-size:12px;color:#aabbcc;display:flex;gap:20px;flex-wrap:wrap;margin-bottom:8px">
-    <span>Fuel Filter: <strong style="color:#00ff8c">ON</strong></span>
-    <span>Default management: <strong style="color:#00ff8c">Model A</strong></span>
+    <span>Fuel Filter: <strong style="color:{'#00ff8c' if meta.get('fuel_filter') else '#ff8844'}">{'ON' if meta.get('fuel_filter') else 'OFF'}</strong></span>
+    <span>Default management: <strong style="color:#00ff8c">family-aware — Model A for Wyckoff/strongest setups, Model B defensive</strong></span>
     <span>Entry mode: <strong>Manual / Immediate confirmation</strong></span>
     <span>Limit entry: <strong style="color:#ffcc00">not preferred by current backtest</strong></span>
   </div>
   <div style="margin-top:10px;font-size:11px;background:#061b12;border-left:3px solid #00ff8c;padding:8px 10px;display:inline-block;color:#aaffcc">
-    <strong>v9.5 Live Workflow:</strong>
+    <strong>{meta.get("scanner_version","v9.5")} Live Workflow:</strong>
     TOP1/TOP3 → manual confirmation → immediate entry → Model A management.
     Limit entry is not preferred by current backtest.
   </div>
@@ -619,6 +981,11 @@ def generate_html(all_setups, meta):
   <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px">{stats_html}</div>
 </div>
 
+<div style="padding:0 32px 24px">
+  <h2 style="border-bottom:1px solid #1e2d40;padding-bottom:8px;margin-bottom:16px">🏷 Setup Family Summary</h2>
+  {family_summary_html}
+</div>
+
 <div style="padding:0 32px 24px;background:linear-gradient(180deg,#050d10 0%,#070b12 100%)">
   <h2 style="border-bottom:2px solid #00ff8c;padding-bottom:8px;margin-bottom:20px;color:#00ff8c">🎯 TOP MANUAL PICKS</h2>
   {picks_html}
@@ -634,6 +1001,8 @@ def generate_html(all_setups, meta):
   {cards_html}
 </div>
 
+{fuel_review_html}
+
 <div style="padding:0 32px 24px">
   <h2 style="border-bottom:1px solid #1e2d40;padding-bottom:8px;margin-bottom:16px">👁 Watchlist</h2>
   {"<div style='overflow-x:auto'><table style='width:100%;border-collapse:collapse;font-size:13px'><thead><tr><th>Symbol</th><th>Dir</th><th>Wyckoff</th><th>Score</th><th>TFS</th><th>Verdict</th><th>Missing</th></tr></thead><tbody>" + watchlist_rows + "</tbody></table></div>" if watchlist_rows else "<p style='color:#556677'>No watchlist setups.</p>"}
@@ -646,11 +1015,12 @@ def generate_html(all_setups, meta):
 
 <div style="background:#0a0f1a;border-top:1px solid #1e2d40;padding:20px 32px;font-size:11px;color:#556677">
   <strong style="color:#8899aa">DISCLAIMER:</strong> This is not financial advice. Trading involves risk.
-  strategy_wyckoff_9_5 | Fuel Filter ON | Generated: {meta.get("report_time","")}
+  strategy_wyckoff_9_5 {meta.get("scanner_version","v9.5")} | Fuel Filter {'ON' if meta.get('fuel_filter') else 'OFF'} | Generated: {meta.get("report_time","")}
 </div>
 
 </body>
 </html>"""
+    return _html, top_picks, fuel_candidates
 
 # ============================================================
 # MAIN
@@ -659,17 +1029,21 @@ def generate_html(all_setups, meta):
 def main():
     global OUTPUT_DIR
 
-    st.USE_TARGET_FEASIBILITY_FILTER = True
+    st.USE_TARGET_FEASIBILITY_FILTER = cfg.USE_TARGET_FEASIBILITY_FILTER
 
     print("=" * 60)
-    print("  Crypto Wyckoff + SMC Scanner v9.5")
-    print("  Fuel Filter: ON | Default model: Model A")
+    print(f"  Crypto Wyckoff + SMC Scanner {cfg.SCANNER_VERSION}")
+    print(f"  Engine: {cfg.ENGINE} | Fuel Filter: {'ON' if cfg.USE_TARGET_FEASIBILITY_FILTER else 'OFF'} | Model: family-aware")
+    print("  Families: WYCKOFF_STRICT + TREND_PULLBACK")
+    print(f"  Cooldown: {cfg.ALERT_COOLDOWN_HOURS}h | WL Review: {'ON' if cfg.ENABLE_WATCHLIST_REVIEW else 'OFF'}")
     print("=" * 60)
+
+    now_dt = datetime.now()
 
     choice = input("\nDane teraźniejsze czy historyczne? (t=teraz / h=historyczne): ").strip().lower()
 
     is_backtest = False
-    data_time   = datetime.now().strftime("%Y-%m-%d %H:%M")
+    data_time   = now_dt.strftime("%Y-%m-%d %H:%M")
 
     if choice == "h":
         is_backtest = True
@@ -684,7 +1058,10 @@ def main():
             is_backtest         = False
             st.BACKTEST_TIME_MS = None
 
-    report_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    report_time = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    # Load cooldown state (skip in backtest mode — no point tracking history)
+    alert_state = {} if is_backtest else _load_alert_state()
 
     print(f"\n[1/4] Pobieranie top {st.TOP_N} kryptowalut...")
     top_crypto = st.get_top_crypto(st.TOP_N)
@@ -717,10 +1094,10 @@ def main():
     eth_regime = st._trend(eth_data["timeframes"].get("1H", []) if eth_data else [])
     print(f"  Regime: {regime.upper()} | BTC 1H: {btc_regime} | ETH 1H: {eth_regime}")
 
-    print("[4/4] Analiza setupów...")
+    print(f"[4/4] Analiza setupów ({cfg.SCANNER_VERSION} multi-family)...")
     raw_setups = []
     for sym, data in all_data.items():
-        s = st.analyze_symbol(sym, data, regime)
+        s = st.analyze_symbol_v95(sym, data, regime)
         if s:
             raw_setups.append(s)
 
@@ -729,36 +1106,141 @@ def main():
     for s in raw_setups:
         s["ts"]       = st.total_score(s)
         s["mps"]      = st.manual_pick_score(s)
-        s["category"] = st.classify(s)
-        s["model"]    = st.recommend_model(s)
+        s["category"] = st.classify_v95(s)
+        s["model"]    = st.recommend_model_v95(s)
 
     active_count = sum(1 for s in raw_setups if s.get("category") not in ("rejected", "watchlist"))
     print(f"  Aktywne setupy (po filtracji): {active_count}")
 
     meta = {
-        "report_time":   report_time,
-        "data_time":     data_time,
-        "is_backtest":   is_backtest,
-        "total_symbols": len(all_data),
-        "regime":        regime,
-        "btc_regime":    btc_regime,
-        "eth_regime":    eth_regime,
+        "report_time":    report_time,
+        "data_time":      data_time,
+        "is_backtest":    is_backtest,
+        "total_symbols":  len(all_data),
+        "regime":         regime,
+        "btc_regime":     btc_regime,
+        "eth_regime":     eth_regime,
+        "scanner_version": cfg.SCANNER_VERSION,
+        "fuel_filter":    st.USE_TARGET_FEASIBILITY_FILTER,
     }
 
-    html = generate_html(raw_setups, meta)
+    html, top_picks, fuel_candidates = generate_html(raw_setups, meta, now_dt=now_dt, alert_state=alert_state)
 
-    ts_str = datetime.now().strftime("%Y_%m_%d_%H%M")
+    ts_str = now_dt.strftime("%Y_%m_%d_%H%M")
     if is_backtest and st.BACKTEST_TIME_MS:
         bt_ts   = datetime.fromtimestamp(st.BACKTEST_TIME_MS / 1000).strftime("%Y_%m_%d_%H%M")
         outfile = os.path.join(OUTPUT_DIR, f"signals_{bt_ts}_backtest.html")
     else:
         outfile = os.path.join(OUTPUT_DIR, f"signals_{ts_str}.html")
 
-    with open(outfile, "w", encoding="utf-8") as f:
-        f.write(html)
+    if cfg.WRITE_TIMESTAMPED_HTML:
+        with open(outfile, "w", encoding="utf-8") as f:
+            f.write(html)
+        print(f"\n✅ Raport: {outfile}")
 
-    print(f"\n✅ Raport: {outfile}")
+    if cfg.WRITE_LATEST_HTML and not is_backtest:
+        latest_path = os.path.join(OUTPUT_DIR, "latest.html")
+        with open(latest_path, "w", encoding="utf-8") as f:
+            f.write(html)
+        print(f"   → latest.html aktualizowany")
+
     print(f"   Aktywnych setupów: {active_count}")
+
+    if not is_backtest:
+        # ── alerts.json ────────────────────────────────────────
+        if cfg.WRITE_ALERTS_JSON:
+            def _alert_entry(s):
+                return {
+                    "symbol":        s["symbol"],
+                    "direction":     s["direction"],
+                    "setup_family":  s.get("setup_family", "WYCKOFF_STRICT"),
+                    "setup_variant": s.get("setup_variant", ""),
+                    "category":      s.get("category", ""),
+                    "mps":           s.get("mps", 0),
+                    "tfs":           s.get("target_feasibility_score"),
+                    "verdict":       s.get("verdict", ""),
+                    "model":         s.get("model", ""),
+                    "entry":         _entry_price(s),
+                    "sl":            s.get("sl"),
+                    "tp2":           s.get("tp2"),
+                    "rr":            s.get("rr"),
+                    "alert_status":  s.get("_alert_status", ""),
+                }
+            alerts_payload = {
+                "generated_at": report_time,
+                "engine":       cfg.SCANNER_VERSION,
+                "top_picks":    [_alert_entry(s) for s in top_picks],
+                "watchlist_review": [_alert_entry(s) for s in fuel_candidates],
+            }
+            alerts_path = os.path.join(OUTPUT_DIR, "alerts.json")
+            with open(alerts_path, "w", encoding="utf-8") as f:
+                json.dump(alerts_payload, f, indent=2)
+            print(f"   → alerts.json zapisany ({len(top_picks)} top picks, {len(fuel_candidates)} WL review)")
+
+        # ── alert_state.json update ────────────────────────────
+        ts_now = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+        for s in top_picks:
+            key = _alert_key(s)
+            alert_state[key] = {
+                "last_seen":     ts_now,
+                "last_mps":      s.get("mps"),
+                "last_tfs":      s.get("target_feasibility_score"),
+                "last_category": s.get("category"),
+                "last_verdict":  s.get("verdict"),
+            }
+        _save_alert_state(alert_state)
+
+        # ── scan_log.csv (append) ──────────────────────────────
+        if cfg.WRITE_SCAN_LOG_CSV:
+            _CSV_LOG_FIELDS = [
+                "timestamp", "symbol", "direction", "setup_family", "setup_variant",
+                "category", "mps", "ts", "tfs", "verdict", "model",
+                "entry", "sl", "tp1a", "tp1b", "tp2", "rr",
+                "status", "macd_5m", "choch_age", "entry_ext",
+                "trend_conflict", "base_strength_label",
+                "watchlist_review_candidate", "alert_status",
+            ]
+            log_path = os.path.join(OUTPUT_DIR, "scan_log.csv")
+            write_header = not os.path.exists(log_path)
+            _active_cats = {"premium_setup", "high_quality", "secondary_quality"}
+            fuel_syms    = {s["symbol"] for s in fuel_candidates}
+            setups_to_log = (
+                [s for s in raw_setups if s.get("category") in _active_cats]
+                + fuel_candidates
+            )
+            with open(log_path, "a", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=_CSV_LOG_FIELDS, extrasaction="ignore")
+                if write_header:
+                    w.writeheader()
+                for s in setups_to_log:
+                    w.writerow({
+                        "timestamp":                  report_time,
+                        "symbol":                     s.get("symbol", ""),
+                        "direction":                  s.get("direction", ""),
+                        "setup_family":               s.get("setup_family", "WYCKOFF_STRICT"),
+                        "setup_variant":              s.get("setup_variant", ""),
+                        "category":                   s.get("category", ""),
+                        "mps":                        s.get("mps", 0),
+                        "ts":                         s.get("ts", 0),
+                        "tfs":                        s.get("target_feasibility_score", ""),
+                        "verdict":                    s.get("verdict", ""),
+                        "model":                      s.get("model", ""),
+                        "entry":                      _entry_price(s) or "",
+                        "sl":                         s.get("sl", ""),
+                        "tp1a":                       s.get("tp1a", ""),
+                        "tp1b":                       s.get("tp1b", ""),
+                        "tp2":                        s.get("tp2", ""),
+                        "rr":                         s.get("rr", ""),
+                        "status":                     s.get("status", ""),
+                        "macd_5m":                    s.get("macd_5m", ""),
+                        "choch_age":                  s.get("choch_age", ""),
+                        "entry_ext":                  s.get("entry_ext", ""),
+                        "trend_conflict":             s.get("trend_conflict", False),
+                        "base_strength_label":        s.get("base_strength_label", ""),
+                        "watchlist_review_candidate": s["symbol"] in fuel_syms,
+                        "alert_status":               s.get("_alert_status", ""),
+                    })
+            print(f"   → scan_log.csv dopisano {len(setups_to_log)} wpisów")
 
     abs_path = os.path.abspath(outfile)
     try:

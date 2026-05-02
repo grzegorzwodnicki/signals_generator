@@ -19,14 +19,22 @@ TARGETS = [
     {"dir": os.path.join(_ROOT, "strategy_wyckoff_9_4", "output"),     "patterns": ["*.html", "*.json", "*.zip"], "label": "strategy_wyckoff_9_4/output/"},
     {"dir": os.path.join(_ROOT, "strategy_wyckoff_9_4", "results"),    "patterns": ["*.html"],                    "label": "strategy_wyckoff_9_4/results/"},
     {"dir": os.path.join(_ROOT, "strategy_wyckoff_9_4", "cache"),      "patterns": ["*.json"],                    "label": "strategy_wyckoff_9_4/cache/"},
-    {"dir": os.path.join(_ROOT, "strategy_wyckoff_9_5", "output"),     "patterns": ["*.html", "*.json", "*.zip"], "label": "strategy_wyckoff_9_5/output/"},
-    {"dir": os.path.join(_ROOT, "strategy_wyckoff_9_5", "results"),    "patterns": ["*.html"],                    "label": "strategy_wyckoff_9_5/results/"},
+    {"dir": os.path.join(_ROOT, "strategy_wyckoff_9_5", "output"),     "patterns": ["*.html", "*.json", "*.zip", "*.csv"], "label": "strategy_wyckoff_9_5/output/"},
+    {"dir": os.path.join(_ROOT, "strategy_wyckoff_9_5", "results"),    "patterns": ["*.html", "*.csv"],                    "label": "strategy_wyckoff_9_5/results/"},
     {"dir": os.path.join(_ROOT, "strategy_wyckoff_9_5", "cache"),      "patterns": ["*.json"],                    "label": "strategy_wyckoff_9_5/cache/"},
-    {"dir": os.path.join(_ROOT, "research", "cache"),                   "patterns": ["*.json"],                    "label": "research/cache/"},
-    {"dir": os.path.join(_ROOT, "research", "output"),                  "patterns": ["*.html", "*.json"],          "label": "research/output/"},
+    {"dir": os.path.join(_ROOT, "research", "cache"),                            "patterns": ["*.json"],             "label": "research/cache/"},
+    {"dir": os.path.join(_ROOT, "research", "output"),                           "patterns": ["*.html", "*.json"],   "label": "research/output/"},
+    {"dir": os.path.join(_ROOT, "strategy_find_3rd_wave", "results", "scanner"), "patterns": ["*.html"],             "label": "strategy_find_3rd_wave/results/scanner/"},
+    {"dir": os.path.join(_ROOT, "strategy_find_3rd_wave", "results", "backtest"),"patterns": ["*.html", "*.csv"],    "label": "strategy_find_3rd_wave/results/backtest/"},
+    {"dir": os.path.join(_ROOT, "strategy_find_3rd_wave", "data", "cache"),      "patterns": ["*.csv"],              "label": "strategy_find_3rd_wave/data/cache/"},
 ]
 
-CACHE_ONLY_DIRS = {"strategy_wyckoff_9_4/cache/", "strategy_wyckoff_9_5/cache/", "research/cache/"}
+CACHE_ONLY_DIRS = {
+    "strategy_wyckoff_9_4/cache/",
+    "strategy_wyckoff_9_5/cache/",
+    "research/cache/",
+    "strategy_find_3rd_wave/data/cache/",
+}
 
 
 def collect_files(cache_only=False):

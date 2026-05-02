@@ -172,7 +172,7 @@ def detect_wyckoff(candles_1h):
         return None
 
     ctx  = candles_1h[-45:-3] if len(candles_1h) > 48 else candles_1h[:-3]
-    tail = candles_1h[-15:]
+    tail = candles_1h[-40:]
 
     if len(ctx) < 15:
         return None
@@ -193,22 +193,29 @@ def detect_wyckoff(candles_1h):
 
     last_close = candles_1h[-1]["close"]
 
-    sos = any(c["close"] > rh and c["close"] > c["open"] for c in tail)
-    sow = any(c["close"] < rl and c["close"] < c["open"] for c in tail)
+    sos_last = -1
+    sow_last = -1
+    for i, c in enumerate(tail):
+        if c["close"] > rh and c["close"] > c["open"]:
+            sos_last = i
+        if c["close"] < rl and c["close"] < c["open"]:
+            sow_last = i
 
-    if sos == sow:
+    if sos_last == -1 and sow_last == -1:
         return None
 
-    direction = "LONG" if sos else "SHORT"
-    pattern   = "Accumulation" if sos else "Distribution"
-    event     = "SOS" if sos else "SOW"
-
-    if sos:
-        phase_d  = sum(1 for c in tail if c["close"] > rh) >= 1
-        pullback = last_close <= rh * 1.025
+    if sos_last > sow_last:
+        direction = "LONG"
+        pattern   = "Accumulation"
+        event     = "SOS"
+        phase_d   = True
+        pullback  = last_close <= rh * 1.025
     else:
-        phase_d  = sum(1 for c in tail if c["close"] < rl) >= 1
-        pullback = last_close >= rl * 0.975
+        direction = "SHORT"
+        pattern   = "Distribution"
+        event     = "SOW"
+        phase_d   = True
+        pullback  = last_close >= rl * 0.975
 
     return {
         "pattern":      pattern,
@@ -883,9 +890,10 @@ def compute_target_feasibility(setup, candles_5m):
 # ============================================================
 
 def analyze_symbol(symbol, data, regime):
+    _live = (BACKTEST_TIME_MS is None)
     candles_1h  = data["timeframes"].get("1H",  [])
-    candles_15m = data["timeframes"].get("15m", [])
-    candles_5m  = data["timeframes"].get("5m",  [])
+    candles_15m = data["timeframes"].get("15m", [])[:-1 if _live else None]
+    candles_5m  = data["timeframes"].get("5m",  [])[:-1 if _live else None]
     price       = data.get("price", 0)
 
     if len(candles_5m) < 30:
@@ -902,6 +910,11 @@ def analyze_symbol(symbol, data, regime):
     engulf   = detect_engulfing(candles_5m, direction)
     pin      = detect_pin_bar(candles_5m, direction)
 
+    if engulf and engulf.get("candles_ago", 99) > 6:
+        engulf = None
+    if pin and pin.get("candles_ago", 99) > 4:
+        pin = None
+
     if engulf:
         pattern = engulf
     elif pin:
@@ -909,7 +922,7 @@ def analyze_symbol(symbol, data, regime):
     else:
         return None
 
-    if not choch or not choch.get("confirmed") or choch["candles_ago"] > 6:
+    if not choch or not choch.get("confirmed") or choch["candles_ago"] > 10:
         return None
 
     choch_age = choch["candles_ago"]
@@ -1294,10 +1307,11 @@ _WYCKOFF_CAUSE_EMPTY = {
 
 def detect_trend_pullback(symbol, data, regime):
     """Detect TREND_PULLBACK setups — HTF trend + LTF demand/supply pullback."""
+    _live = (BACKTEST_TIME_MS is None)
     candles_1h  = data["timeframes"].get("1H",  [])
     candles_4h  = data["timeframes"].get("4H",  [])
-    candles_15m = data["timeframes"].get("15m", [])
-    candles_5m  = data["timeframes"].get("5m",  [])
+    candles_15m = data["timeframes"].get("15m", [])[:-1 if _live else None]
+    candles_5m  = data["timeframes"].get("5m",  [])[:-1 if _live else None]
     price       = data.get("price", 0)
     turnover    = data.get("turnover", 0)
 
@@ -1328,6 +1342,12 @@ def detect_trend_pullback(symbol, data, regime):
 
     engulf = detect_engulfing(candles_5m, direction)
     pin    = detect_pin_bar(candles_5m, direction)
+
+    if engulf and engulf.get("candles_ago", 99) > 3:
+        engulf = None
+    if pin and pin.get("candles_ago", 99) > 2:
+        pin = None
+
     if engulf:
         pattern = engulf
     elif pin:

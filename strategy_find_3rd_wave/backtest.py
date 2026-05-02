@@ -37,12 +37,17 @@ from strategy import (
     analyze_strategy,
     normalize_ohlcv_dataframe,
 )
+from utils import normalize_timeframe
 
 _THIS_DIR  = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(_THIS_DIR, "results", "backtest")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 DEBUG = os.environ.get("DEBUG_WAVE3", "0") == "1"
+
+# Default transaction-cost assumptions (applied on entry + exit)
+FEE_RATE      = 0.0006   # 0.06% taker fee (Bybit-style)
+SLIPPAGE_RATE = 0.0002   # 0.02% estimated slippage
 
 # ---------------------------------------------------------------------------
 # Config used for backtest runs
@@ -72,14 +77,19 @@ def _simulate_trade(
     df: pd.DataFrame,
     result: StrategyResult,
     signal_bar: int,
-    tp_mode: str,          # "t2" or "t1t2"
+    tp_mode: str,           # "t2" or "t1t2"
+    fee_rate: float = FEE_RATE,
+    slippage_rate: float = SLIPPAGE_RATE,
 ) -> Dict:
     """
     Simulate a trade forward from signal_bar using SL and TP levels.
-    Returns a trade dict.
 
     tp_mode "t2"   → single target at target_2, full position.
     tp_mode "t1t2" → 50% off at target_1, 50% off at target_2.
+
+    Costs: cost_r = 2 * entry * (fee_rate + slippage_rate) / risk
+    (entry-side + exit-side, symmetric approximation)
+    pnl_r_net = pnl_r - cost_r
     """
     entry  = result.entry_price
     sl     = result.stop_loss
@@ -159,6 +169,10 @@ def _simulate_trade(
         pnl_r = partial_r + remaining_r
     # If tp_mode == "t1t2" but no partial was hit, pnl_r is already the full-position result
 
+    # Task 2: round-trip cost (entry + exit fees and slippage)
+    cost_r    = round(2 * entry * (fee_rate + slippage_rate) / risk, 4)
+    pnl_r_net = round(pnl_r - cost_r, 4)
+
     bars_held = exit_bar - signal_bar
 
     return _build_trade_row(
@@ -169,6 +183,8 @@ def _simulate_trade(
         exit_price=exit_price,
         exit_reason=exit_reason,
         pnl_r=round(pnl_r, 4),
+        cost_r=cost_r,
+        pnl_r_net=pnl_r_net,
         bars_held=bars_held,
     )
 
@@ -182,6 +198,8 @@ def _open_trade_row(result: StrategyResult, signal_bar: int, df: pd.DataFrame) -
         exit_price=None,
         exit_reason="open",
         pnl_r=None,
+        cost_r=None,
+        pnl_r_net=None,
         bars_held=None,
     )
 
@@ -194,6 +212,8 @@ def _build_trade_row(
     exit_price: Optional[float],
     exit_reason: str,
     pnl_r: Optional[float],
+    cost_r: Optional[float],
+    pnl_r_net: Optional[float],
     bars_held: Optional[int],
 ) -> Dict:
     sig_ts = df["timestamp"].iloc[signal_bar] if signal_bar < len(df) else None
@@ -217,7 +237,9 @@ def _build_trade_row(
         "target_3":             result.target_3,
         "exit_price":           exit_price,
         "exit_reason":          exit_reason,
-        "pnl_r":                pnl_r,
+        "pnl_r":                pnl_r,        # gross (before fees/slippage)
+        "cost_r":               cost_r,
+        "pnl_r_net":            pnl_r_net,    # net (after fees/slippage)
         "bars_held":            bars_held,
         "rr_t1":                result.risk_reward_to_t1,
         "rr_t2":                result.risk_reward_to_t2,
@@ -243,6 +265,9 @@ def run_backtest(
     tf: str,
     config: StrategyConfig,
     tp_mode: str = "t2",
+    allow_overlapping_trades: bool = False,
+    fee_rate: float = FEE_RATE,
+    slippage_rate: float = SLIPPAGE_RATE,
 ) -> List[Dict]:
     """
     Replay df_full candle by candle.
@@ -250,13 +275,15 @@ def run_backtest(
     At each bar i (starting at MIN_WINDOW):
       1. Feed df_full.iloc[:i+1] to analyze_strategy()
       2. If signal is LONG_SETUP or SHORT_SETUP AND signal_index == i (fresh):
-         a. Check setup_id not already traded
-         b. Simulate forward
+         a. If allow_overlapping_trades=False, skip while previous trade is open
+         b. Check setup_id not already traded
+         c. Simulate forward including fees / slippage
     """
     df_full = normalize_ohlcv_dataframe(df_full)
     n = len(df_full)
     trades: List[Dict] = []
     seen_ids: set = set()
+    last_exit_bar: int = -1     # used only when allow_overlapping_trades=False
 
     print(f"\nReplaying {n} candles for {symbol} {tf} …")
 
@@ -277,9 +304,12 @@ def run_backtest(
             continue
 
         # Enter only on the exact signal candle.
-        # With max_bars_after_bos=0, signal_index == the BOS/D candle == i
-        # when the signal is fresh, so this check is always safe.
+        # With max_bars_after_bos=0, signal_index == BOS/D candle == i.
         if result.signal_index != i:
+            continue
+
+        # Task 1: one-position-at-a-time gate
+        if not allow_overlapping_trades and i <= last_exit_bar:
             continue
 
         sid = result.setup_id
@@ -288,14 +318,20 @@ def run_backtest(
         if sid is not None:
             seen_ids.add(sid)
 
-        trade = _simulate_trade(df_full, result, i, tp_mode)
+        trade = _simulate_trade(df_full, result, i, tp_mode, fee_rate, slippage_rate)
         trades.append(trade)
+
+        # Update last_exit_bar so next trade waits
+        if not allow_overlapping_trades:
+            eb = trade.get("exit_bar")
+            last_exit_bar = eb if eb is not None else i
+
         print(
             f"  [{result.signal}] bar={i} "
             f"entry={result.entry_price:.4f} "
             f"sl={result.stop_loss:.4f} "
             f"tp2={result.target_2:.4f} "
-            f"→ {trade['exit_reason']} pnl={trade['pnl_r']}"
+            f"→ {trade['exit_reason']} gross={trade['pnl_r']} net={trade['pnl_r_net']}"
         )
 
     print(f"  Done. Trades found: {len(trades)}")
@@ -306,36 +342,43 @@ def run_backtest(
 # Statistics
 # ---------------------------------------------------------------------------
 
+def _pnl_stats(pnls: list, n_total: int) -> dict:
+    """Compute a standard set of metrics from a list of closed-trade P&L values."""
+    if not pnls:
+        return {}
+    wins   = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p <= 0]
+    total  = round(sum(pnls), 4)
+    ev     = round(total / len(pnls), 4)
+    wr     = round(len(wins) / len(pnls) * 100, 1)
+    avg_w  = round(sum(wins)   / len(wins),   4) if wins   else 0.0
+    avg_l  = round(sum(losses) / len(losses), 4) if losses else 0.0
+    gp = sum(wins);  gl = abs(sum(losses))
+    pf = round(gp / gl, 4) if gl > 0 else float("inf")
+    # Max drawdown
+    peak = eq = max_dd = 0.0
+    for p in pnls:
+        eq += p
+        if eq > peak: peak = eq
+        dd = peak - eq
+        if dd > max_dd: max_dd = dd
+    return {
+        "win_rate": wr, "total_r": total, "ev_per_trade": ev,
+        "avg_win_r": avg_w, "avg_loss_r": avg_l,
+        "profit_factor": pf, "max_dd_r": round(max_dd, 4),
+    }
+
+
 def compute_stats(trades: List[Dict]) -> Dict:
     closed = [t for t in trades if t["pnl_r"] is not None and t["exit_reason"] != "open"]
     if not closed:
         return {"n_trades": 0, "n_closed": 0}
 
-    pnls = [t["pnl_r"] for t in closed]
-    wins   = [p for p in pnls if p > 0]
-    losses = [p for p in pnls if p <= 0]
+    gross_pnls = [t["pnl_r"] for t in closed]
+    net_pnls   = [t["pnl_r_net"] for t in closed if t.get("pnl_r_net") is not None]
 
-    total_r  = round(sum(pnls), 4)
-    win_rate = round(len(wins) / len(closed) * 100, 1) if closed else 0.0
-    avg_win  = round(sum(wins)   / len(wins),   4) if wins   else 0.0
-    avg_loss = round(sum(losses) / len(losses), 4) if losses else 0.0
-    ev       = round(total_r / len(closed), 4)
-
-    gross_profit = sum(wins)
-    gross_loss   = abs(sum(losses))
-    pf = round(gross_profit / gross_loss, 4) if gross_loss > 0 else float("inf")
-
-    # Max drawdown (running sum)
-    peak = 0.0
-    eq   = 0.0
-    max_dd = 0.0
-    for p in pnls:
-        eq += p
-        if eq > peak:
-            peak = eq
-        dd = peak - eq
-        if dd > max_dd:
-            max_dd = dd
+    gross = _pnl_stats(gross_pnls, len(trades))
+    net   = _pnl_stats(net_pnls,   len(trades))
 
     bars_held_list = [t["bars_held"] for t in closed if t["bars_held"] is not None]
     avg_bars = round(sum(bars_held_list) / len(bars_held_list), 1) if bars_held_list else 0.0
@@ -346,21 +389,23 @@ def compute_stats(trades: List[Dict]) -> Dict:
     short_wr = round(len([t for t in shorts if t["pnl_r"] > 0]) / len(shorts) * 100, 1) if shorts else 0.0
 
     return {
-        "n_trades":     len(trades),
-        "n_closed":     len(closed),
-        "n_open":       len(trades) - len(closed),
-        "n_wins":       len(wins),
-        "n_losses":     len(losses),
-        "win_rate":     win_rate,
-        "total_r":      total_r,
-        "ev_per_trade": ev,
-        "avg_win_r":    avg_win,
-        "avg_loss_r":   avg_loss,
-        "profit_factor": pf,
-        "max_dd_r":     round(max_dd, 4),
-        "avg_bars_held": avg_bars,
-        "n_longs":      len(longs),
-        "n_shorts":     len(shorts),
+        "n_trades":      len(trades),
+        "n_closed":      len(closed),
+        "n_open":        len(trades) - len(closed),
+        "n_wins":        len([p for p in gross_pnls if p > 0]),
+        "n_losses":      len([p for p in gross_pnls if p <= 0]),
+        # gross
+        **{k: v for k, v in gross.items()},
+        # net (prefixed)
+        "net_total_r":      net.get("total_r", 0.0),
+        "net_ev_per_trade": net.get("ev_per_trade", 0.0),
+        "net_profit_factor": net.get("profit_factor", 0.0),
+        "net_win_rate":     net.get("win_rate", 0.0),
+        "net_max_dd_r":     net.get("max_dd_r", 0.0),
+        # breakdowns
+        "avg_bars_held":  avg_bars,
+        "n_longs":        len(longs),
+        "n_shorts":       len(shorts),
         "long_win_rate":  long_wr,
         "short_win_rate": short_wr,
     }
@@ -398,30 +443,54 @@ def generate_html(
     start_dt: datetime,
     end_dt: datetime,
     tp_mode: str,
+    run_params: Optional[Dict] = None,
 ) -> str:
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    rp = run_params or {}
+    allow_overlap  = rp.get("allow_overlapping_trades", False)
+    fee_rate       = rp.get("fee_rate", FEE_RATE)
+    slippage_rate  = rp.get("slippage_rate", SLIPPAGE_RATE)
+    cost_total_pct = (fee_rate + slippage_rate) * 2 * 100
+
+    now_str   = datetime.now().strftime("%Y-%m-%d %H:%M")
     start_str = start_dt.strftime("%Y-%m-%d")
     end_str   = end_dt.strftime("%Y-%m-%d")
 
-    pf_color = "#4caf50" if stats.get("profit_factor", 0) >= 1.5 else \
-               "#ff9800" if stats.get("profit_factor", 0) >= 1.0 else "#f44336"
-    wr_color = "#4caf50" if stats.get("win_rate", 0) >= 50 else "#f44336"
-    ev_color = "#4caf50" if stats.get("ev_per_trade", 0) > 0 else "#f44336"
+    def _color_pf(v):
+        return "#4caf50" if v >= 1.5 else "#ff9800" if v >= 1.0 else "#f44336"
+    def _color_ev(v):
+        return "#4caf50" if v > 0 else "#f44336"
+    def _color_wr(v):
+        return "#4caf50" if v >= 50 else "#f44336"
+
+    gwr = stats.get("win_rate", 0); nwr = stats.get("net_win_rate", 0)
+    gpf = stats.get("profit_factor", 0); npf = stats.get("net_profit_factor", 0)
+    gev = stats.get("ev_per_trade", 0); nev = stats.get("net_ev_per_trade", 0)
 
     stats_html = f"""
     <table class="stats-table">
-        {_stat_row("Trades (total)", stats.get("n_trades", 0))}
-        {_stat_row("Closed", stats.get("n_closed", 0))}
-        {_stat_row("Open / Unfilled", stats.get("n_open", 0))}
-        {_stat_row("Wins", stats.get("n_wins", 0))}
-        {_stat_row("Losses", stats.get("n_losses", 0))}
-        <tr><td>Win Rate</td><td><b style="color:{wr_color}">{stats.get("win_rate", 0):.1f}%</b></td></tr>
-        {_stat_row("Total R", f"{stats.get('total_r', 0):+.2f}R")}
-        <tr><td>EV per Trade</td><td><b style="color:{ev_color}">{stats.get('ev_per_trade', 0):+.4f}R</b></td></tr>
-        <tr><td>Profit Factor</td><td><b style="color:{pf_color}">{stats.get('profit_factor', 0):.2f}</b></td></tr>
-        {_stat_row("Avg Win", f"{stats.get('avg_win_r', 0):+.4f}R")}
-        {_stat_row("Avg Loss", f"{stats.get('avg_loss_r', 0):+.4f}R")}
-        {_stat_row("Max Drawdown", f"{stats.get('max_dd_r', 0):.4f}R")}
+        <tr><th style="color:#aaa;font-weight:normal">Metric</th>
+            <th style="color:#90caf9">Gross</th>
+            <th style="color:#80cbc4">Net (after costs)</th></tr>
+        <tr><td>Trades (total)</td><td colspan="2"><b>{stats.get("n_trades", 0)}</b></td></tr>
+        <tr><td>Closed</td><td colspan="2"><b>{stats.get("n_closed", 0)}</b></td></tr>
+        <tr><td>Open / Unfilled</td><td colspan="2"><b>{stats.get("n_open", 0)}</b></td></tr>
+        <tr><td>Wins / Losses</td><td colspan="2"><b>{stats.get("n_wins",0)} / {stats.get("n_losses",0)}</b></td></tr>
+        <tr><td>Win Rate</td>
+            <td><b style="color:{_color_wr(gwr)}">{gwr:.1f}%</b></td>
+            <td><b style="color:{_color_wr(nwr)}">{nwr:.1f}%</b></td></tr>
+        <tr><td>Total R</td>
+            <td><b style="color:{_color_ev(stats.get('total_r',0))}">{stats.get('total_r',0):+.2f}R</b></td>
+            <td><b style="color:{_color_ev(stats.get('net_total_r',0))}">{stats.get('net_total_r',0):+.2f}R</b></td></tr>
+        <tr><td>EV per Trade</td>
+            <td><b style="color:{_color_ev(gev)}">{gev:+.4f}R</b></td>
+            <td><b style="color:{_color_ev(nev)}">{nev:+.4f}R</b></td></tr>
+        <tr><td>Profit Factor</td>
+            <td><b style="color:{_color_pf(gpf)}">{gpf:.2f}</b></td>
+            <td><b style="color:{_color_pf(npf)}">{npf:.2f}</b></td></tr>
+        {_stat_row("Avg Win (gross)", f"{stats.get('avg_win_r', 0):+.4f}R")}
+        {_stat_row("Avg Loss (gross)", f"{stats.get('avg_loss_r', 0):+.4f}R")}
+        {_stat_row("Max DD (gross)", f"{stats.get('max_dd_r', 0):.4f}R")}
+        {_stat_row("Max DD (net)", f"{stats.get('net_max_dd_r', 0):.4f}R")}
         {_stat_row("Avg Bars Held", stats.get("avg_bars_held", 0))}
         {_stat_row("Longs", f"{stats.get('n_longs', 0)} ({stats.get('long_win_rate', 0):.1f}% WR)")}
         {_stat_row("Shorts", f"{stats.get('n_shorts', 0)} ({stats.get('short_win_rate', 0):.1f}% WR)")}
@@ -440,12 +509,19 @@ def generate_html(
         return f"{pnl:+.4f}R"
 
     trade_rows = ""
-    cumulative_r = 0.0
+    cum_gross = 0.0
+    cum_net   = 0.0
     for i, t in enumerate(trades, 1):
-        pnl = t.get("pnl_r")
-        if pnl is not None and t.get("exit_reason") != "open":
-            cumulative_r += pnl
-        pc = _pnl_color(pnl)
+        pnl      = t.get("pnl_r")
+        pnl_net  = t.get("pnl_r_net")
+        cost     = t.get("cost_r")
+        not_open = t.get("exit_reason") != "open"
+        if pnl is not None and not_open:
+            cum_gross += pnl
+        if pnl_net is not None and not_open:
+            cum_net += pnl_net
+        pc     = _pnl_color(pnl)
+        pc_net = _pnl_color(pnl_net)
         reason_short = (t.get("reason") or "")[:60]
         trade_rows += f"""
         <tr>
@@ -459,17 +535,28 @@ def generate_html(
             <td>{t.get("exit_time", "")[:16]}</td>
             <td>{t.get("exit_reason", "")}</td>
             <td style="color:{pc}"><b>{_pnl_str(pnl)}</b></td>
-            <td style="color:{'#4caf50' if cumulative_r >= 0 else '#f44336'}">{cumulative_r:+.2f}R</td>
+            <td style="color:#888;font-size:11px">{f"−{cost:.4f}R" if cost is not None else "—"}</td>
+            <td style="color:{pc_net}"><b>{_pnl_str(pnl_net)}</b></td>
+            <td style="color:{'#4caf50' if cum_net >= 0 else '#f44336'}">{cum_net:+.2f}R</td>
             <td style="font-size:11px;color:#aaa">{reason_short}</td>
         </tr>"""
 
-    exec_assumptions = """
+    position_model_str = (
+        "Overlapping trades allowed"
+        if allow_overlap else
+        "<b>One position at a time</b> — new signals skipped while a trade is open"
+    )
+    exec_assumptions = f"""
 <h2>Execution Assumptions</h2>
 <table class="stats-table">
   <tr><td>Entry</td><td><b>BOS candle close</b> (or D-candle close when require_bos=False)</td></tr>
   <tr><td>SL / TP checking</td><td><b>Starts from the next candle</b> after the signal bar</td></tr>
   <tr><td>Intrabar conflict</td><td><b>SL wins</b> — if both SL and TP are touched in the same candle, SL is taken</td></tr>
+  <tr><td>Position model</td><td>{position_model_str}</td></tr>
   <tr><td>Deduplication</td><td>One trade per setup_id (wave timestamps); re-entries blocked by setup_id seen-set</td></tr>
+  <tr><td>Fee rate</td><td>{fee_rate*100:.3f}% per side (taker)</td></tr>
+  <tr><td>Slippage rate</td><td>{slippage_rate*100:.3f}% per side</td></tr>
+  <tr><td>Round-trip cost</td><td>≈ {cost_total_pct:.3f}% of entry × 2 sides; expressed in R in each trade row</td></tr>
   <tr><td>Open trades at end</td><td>Closed at last candle close, marked <i>close_at_end</i></td></tr>
 </table>"""
 
@@ -516,7 +603,7 @@ def generate_html(
       <th>#</th><th>Signal Time</th><th>Dir</th>
       <th>Entry</th><th>SL</th><th>TP2</th>
       <th>Exit</th><th>Exit Time</th><th>Reason</th>
-      <th>PnL (R)</th><th>Cum R</th><th>Setup note</th>
+      <th>Gross (R)</th><th>Cost</th><th>Net (R)</th><th>Cum Net</th><th>Setup note</th>
     </tr>
   </thead>
   <tbody>{trade_rows}</tbody>
@@ -546,13 +633,30 @@ def _open_in_browser(path: str) -> None:
 # Interactive CLI
 # ---------------------------------------------------------------------------
 
-def _parse_date(s: str) -> datetime:
-    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+def _parse_date(s: str, end_of_day: bool = False) -> datetime:
+    """
+    Parse a date string.  If end_of_day=True and only a date (no time) is
+    provided, the result is set to 23:59:59 UTC so the full day is included.
+    """
+    date_fmts  = ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y")
+    dt_fmts    = ("%d/%m/%Y %H:%M", "%Y-%m-%d %H:%M", "%d/%m/%Y %H:%M:%S")
+
+    for fmt in dt_fmts:
         try:
             return datetime.strptime(s.strip(), fmt).replace(tzinfo=timezone.utc)
         except ValueError:
             continue
-    raise ValueError(f"Cannot parse date: {s!r} — use dd/mm/yyyy")
+
+    for fmt in date_fmts:
+        try:
+            dt_obj = datetime.strptime(s.strip(), fmt).replace(tzinfo=timezone.utc)
+            if end_of_day:
+                dt_obj = dt_obj.replace(hour=23, minute=59, second=59)
+            return dt_obj
+        except ValueError:
+            continue
+
+    raise ValueError(f"Cannot parse date: {s!r} — use dd/mm/yyyy or dd/mm/yyyy HH:MM")
 
 
 def main() -> None:
@@ -565,13 +669,14 @@ def main() -> None:
     symbol  = sym_raw if sym_raw.endswith("USDT") else sym_raw + "USDT"
 
     # Timeframe
-    tf = input("Timeframe [15m / 1H / 4H] (default 1H): ").strip() or "1H"
+    tf_raw = input("Timeframe [15m / 1H / 4H / 60 / 240 …] (default 1H): ").strip() or "1H"
+    tf = normalize_timeframe(tf_raw)
 
     # Date range
-    start_raw = input("Start date (dd/mm/yyyy): ").strip()
-    end_raw   = input("End date   (dd/mm/yyyy): ").strip()
-    start_dt  = _parse_date(start_raw)
-    end_dt    = _parse_date(end_raw)
+    start_raw = input("Start date (dd/mm/yyyy or dd/mm/yyyy HH:MM): ").strip()
+    end_raw   = input("End date   (dd/mm/yyyy or dd/mm/yyyy HH:MM): ").strip()
+    start_dt  = _parse_date(start_raw, end_of_day=False)
+    end_dt    = _parse_date(end_raw,   end_of_day=True)
 
     start_ms = int(start_dt.timestamp() * 1000)
     end_ms   = int(end_dt.timestamp()   * 1000)
@@ -579,6 +684,16 @@ def main() -> None:
     # TP mode
     tp_raw  = input("TP mode: [t2] = full at TP2, [t1t2] = 50/50 (default t2): ").strip().lower()
     tp_mode = tp_raw if tp_raw in ("t2", "t1t2") else "t2"
+
+    # Position model
+    ovlp_raw = input("Allow overlapping trades? [y/N] (default N): ").strip().lower()
+    allow_overlapping = ovlp_raw == "y"
+
+    run_params = {
+        "allow_overlapping_trades": allow_overlapping,
+        "fee_rate":      FEE_RATE,
+        "slippage_rate": SLIPPAGE_RATE,
+    }
 
     print(f"\nFetching {symbol} {tf} from {start_dt.date()} to {end_dt.date()} …")
     df_raw = dt.fetch_candles_range(symbol, tf, start_ms, end_ms, use_cache=True)
@@ -589,7 +704,10 @@ def main() -> None:
 
     print(f"  Fetched {len(df_raw)} candles.")
 
-    trades = run_backtest(df_raw, symbol, tf, BACKTEST_CONFIG, tp_mode)
+    trades = run_backtest(
+        df_raw, symbol, tf, BACKTEST_CONFIG, tp_mode,
+        allow_overlapping_trades=allow_overlapping,
+    )
     stats  = compute_stats(trades)
 
     # Display summary
@@ -607,7 +725,7 @@ def main() -> None:
 
     save_csv(trades, csv_path)
 
-    html = generate_html(trades, stats, symbol, tf, start_dt, end_dt, tp_mode)
+    html = generate_html(trades, stats, symbol, tf, start_dt, end_dt, tp_mode, run_params)
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
     print(f"  HTML saved: {html_path}")

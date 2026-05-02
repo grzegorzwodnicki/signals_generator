@@ -17,6 +17,7 @@ from datetime import datetime
 
 import data as dt
 from strategy import StrategyConfig, StrategyResult, analyze_strategy
+from utils import normalize_timeframe
 
 _THIS_DIR  = os.path.dirname(os.path.abspath(__file__))
 OUTPUT_DIR = os.path.join(_THIS_DIR, "results", "scanner")
@@ -271,10 +272,11 @@ def generate_html(
   <div style="color:#8899aa;font-size:12px">
     Report: <strong>{meta.get("report_time","")}</strong> |
     Data: <strong>{meta.get("data_time","")}</strong> |
-    {"⚠ BACKTEST MODE" if meta.get("is_backtest") else "✅ LIVE DATA"} |
+    {"⚠ HISTORICAL MODE" if meta.get("is_backtest") else "✅ LIVE DATA"} |
     Symbols: <strong>{meta.get("total_symbols",0)}</strong> |
     TF: <strong>{", ".join(meta.get("timeframes",[]))}</strong>
   </div>
+  {"<div style='margin-top:8px;padding:8px 12px;background:#1a1a00;border:1px solid #665500;border-radius:4px;color:#ffdd88;font-size:12px'>⚠ Historical scan uses the current top symbols list, but OHLCV data ending at the selected historical timestamp. Prices shown are the last close of the fetched data, not live quotes.</div>" if meta.get("is_backtest") else ""}
 </div>
 
 <div style="padding:20px 28px">
@@ -313,13 +315,12 @@ def generate_html(
 
 def scan_symbol(sym_info: dict, timeframes: list, end_time_ms=None) -> list:
     """Fetch OHLCV for symbol × timeframes, run analyze_strategy, return results."""
-    sym    = sym_info["symbol"]
-    price  = sym_info.get("price", 0)
+    sym     = sym_info["symbol"]
     results = []
 
     for tf in timeframes:
         try:
-            # TASK 5 — use range fetch for historical mode (hits cache first)
+            # Use range fetch for historical mode (hits cache first)
             if end_time_ms is not None:
                 tf_duration_ms = _TF_MS.get(tf, 900_000)
                 start_ms = end_time_ms - 420 * tf_duration_ms
@@ -328,12 +329,15 @@ def scan_symbol(sym_info: dict, timeframes: list, end_time_ms=None) -> list:
                 df = dt.fetch_candles(sym, tf, end_time_ms=None)
             if df.empty or len(df) < 50:
                 continue
+            # TASK 1: use the last close of the fetched data as the display price,
+            # not sym_info["price"] (which is the live ticker, wrong in historical mode).
+            analysis_price = float(df["close"].iloc[-1])
             result = analyze_strategy(df, SCANNER_CONFIG)
             results.append({
                 "symbol":    sym,
                 "timeframe": tf,
-                "price":     price,
-                "n_candles": len(df),   # TASK 2 — for freshness display
+                "price":     analysis_price,
+                "n_candles": len(df),
                 "result":    result,
             })
         except Exception as e:
@@ -375,8 +379,8 @@ def main():
     except ValueError:
         n_symbols = DEFAULT_TOP_N
 
-    tf_input = input(f"Timeframes [{','.join(DEFAULT_TIMEFRAMES)}]: ").strip()
-    timeframes = [t.strip() for t in tf_input.split(",")] if tf_input else DEFAULT_TIMEFRAMES
+    tf_input   = input(f"Timeframes [{','.join(DEFAULT_TIMEFRAMES)}]: ").strip()
+    timeframes = [normalize_timeframe(t.strip()) for t in tf_input.split(",")] if tf_input else DEFAULT_TIMEFRAMES
 
     report_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 

@@ -435,3 +435,192 @@ Interactive: mode (current/backtest), symbol source (1=Top400 / 2=`crypto_ftmo.t
 
 - `crypto_ftmo.txt` — option 2 in `fetch_and_zip_crypto.py`
 - `crypto_breakout.txt` — option 3
+
+---
+
+## Active development — `strategy_find_3rd_wave/` (Wave 3 scanner)
+
+Separate strategy project: detects Elliott Wave 3 entry opportunities on crypto perpetuals.
+
+### File structure
+
+| File | Role |
+|---|---|
+| `strategy.py` | Pure analysis — no I/O. Wave detection, BOS, POC, harmonic, scoring. |
+| `data.py` | Bybit OHLCV fetch + local CSV cache. Returns raw int-ms timestamps. |
+| `scanner.py` | Live / historical scan → dark-theme HTML report, Chrome auto-open. |
+| `backtest.py` | Candle-by-candle replay → CSV trades + HTML report with gross/net stats. |
+| `config.py` | I/O paths and API settings (not strategy params). |
+| `utils.py` | `normalize_timeframe()` — shared between scanner and backtest. |
+| `tests/test_strategy.py` | 23 pytest unit tests for strategy.py. |
+
+Run from project root:
+
+```bash
+source venv/bin/activate
+python strategy_find_3rd_wave/scanner.py
+python strategy_find_3rd_wave/backtest.py
+```
+
+Output dirs (relative to the script's own directory):
+- Scanner reports → `strategy_find_3rd_wave/results/scanner/`
+- Backtest results → `strategy_find_3rd_wave/results/backtest/`
+- OHLCV cache → `strategy_find_3rd_wave/data/cache/`
+
+### Strategy logic (`strategy.py`)
+
+**Wave structure: X → A → (B → C → D)**
+
+| Point | Role |
+|---|---|
+| X | Wave 1 origin (swing low for LONG, swing high for SHORT) |
+| A | Wave 1 peak (swing high for LONG, swing low for SHORT) |
+| B/C/D | Wave 2 correction (D is the entry zone) |
+
+**`StrategyConfig` — key parameters:**
+
+```python
+@dataclass
+class StrategyConfig:
+    swing_left: int = 3           # pivot lookback
+    swing_right: int = 3          # pivot confirmation bars (no lookahead)
+    min_wave1_atr: float = 2.0    # minimum wave 1 size in ATR units
+    retracement_min: float = 0.382
+    retracement_max: float = 0.886
+    preferred_retracement_min: float = 0.5   # golden pocket
+    preferred_retracement_max: float = 0.786
+    poc_distance_atr: float = 0.5  # D must be within N ATR of wave 1 POC
+    harmonic_tolerance: float = 0.08  # AB=CD equality tolerance
+    require_bos: bool = True       # BOS (break of structure at C) required
+    min_rr_to_wave1_high: float = 1.5
+    max_bars_after_bos: int = 1    # freshness gate: scanner=3, backtest=0
+    max_wave1_bars: int = 100
+    max_correction_bars: int = 150
+    max_bars_after_d: int = 50
+    require_harmonic: bool = False
+```
+
+**`StrategyResult` — key fields:**
+
+```python
+signal: SignalType  # LONG_SETUP / SHORT_SETUP / WAITING_FOR_BOS / NO_SIGNAL / INVALID
+entry_price, stop_loss, target_1, target_2, target_3
+risk_reward_to_t1/t2/t3
+bos_index, bos_price          # BOS candle bar index and close price
+signal_index, signal_time     # BOS candle (require_bos=True) or D candle (False)
+setup_id                      # stable dedup key: direction + wave timestamps
+wave: WaveStructure           # full wave geometry
+```
+
+**Signal semantics:**
+- `signal_index` = index of the BOS candle when `require_bos=True`, or D candle when `False`
+- Signal rank: `INVALID(0) < NO_SIGNAL(1) < WAITING_FOR_BOS(2) < LONG_SETUP/SHORT_SETUP(3)`
+- LONG and SHORT are evaluated independently; higher-ranked result wins (tied: higher RR to T2)
+
+**Core functions:**
+
+| Function | Description |
+|---|---|
+| `normalize_ohlcv_dataframe(df)` | Ensures timestamp column, RangeIndex, ascending sort; converts Bybit ms timestamps |
+| `analyze_strategy(df, config)` | Main entry point — normalises, detects swings, evaluates LONG+SHORT, returns best |
+| `find_wave_structures(...)` | Returns all valid wave structures for one direction, sorted by `_score_wave_structure()` |
+| `_score_wave_structure(wave)` | Score: +5 ret valid, +10 preferred zone, +15 POC valid, +5 harmonic, +3 POC proximity |
+| `_validate_and_signal(wave, ...)` | Applies all gates to one wave → StrategyResult |
+| `_find_best_bcd(...)` | Scored search over up to 5×5×5 = 125 B/C/D combinations |
+| `validate_bos(df, d_idx, c_price, dir, as_of)` | First close past C after D; returns (found, bar_idx, close_price) |
+| `calculate_volume_poc(df, start, end)` | Volume profile POC via 50-bin histogram |
+| `calculate_atr(df, period=14)` | EW-smoothed true range |
+| `detect_swings(df, left, right)` | Pivot H/L with `confirmed_index = i + right` (no lookahead) |
+
+**Targets (LONG):**
+- T1 = A price (wave 1 high)
+- T2 = A + 1.272 × wave1_size
+- T3 = A + 1.618 × wave1_size
+
+**SL:** D price − 0.1 × ATR (LONG) / D price + 0.1 × ATR (SHORT)
+
+### Scanner (`scanner.py`)
+
+```
+Interactive: t = live data | h = historical (dd/mm/yyyy hh:mm)
+```
+
+- `SCANNER_CONFIG.max_bars_after_bos = 3` — shows setups up to 3 bars after BOS
+- Historical mode: `analysis_price = df["close"].iloc[-1]` (not live ticker price)
+- Historical mode: uses `fetch_candles_range()` — hits CSV cache before Bybit
+- Freshness panel on each card: 🟢 0 bars / 🟡 1–2 bars / 🔴 3+ bars since BOS
+- Historical mode warning banner in HTML
+- `DEBUG_WAVE3=1` env var → print per-symbol errors
+- Timeframe input normalised via `normalize_timeframe()` (e.g. `1h → 1H`, `60 → 1H`)
+
+### Backtest (`backtest.py`)
+
+```
+Interactive prompts:
+  Symbol         → auto-appends USDT
+  Timeframe      → normalized via normalize_timeframe()
+  Start / End    → dd/mm/yyyy or dd/mm/yyyy HH:MM
+                   End date-only → 23:59:59 UTC (full day included)
+  TP mode        → t2 (full at TP2) | t1t2 (50% at T1, 50% at T2)
+  Overlap mode   → y = overlapping trades allowed | N = one at a time (default)
+```
+
+**`BACKTEST_CONFIG.max_bars_after_bos = 0`** — enter only on the exact BOS/D candle.
+
+**`run_backtest()` parameters:**
+- `allow_overlapping_trades=False` — when False, new signals skipped while `i <= last_exit_bar`
+- `fee_rate=0.0006` — taker fee per side (0.06%)
+- `slippage_rate=0.0002` — estimated slippage per side (0.02%)
+
+**Trade simulation (`_simulate_trade`):**
+- SL always wins over TP on the same candle (conservative intrabar)
+- `cost_r = 2 * entry * (fee_rate + slippage_rate) / risk` (round-trip cost in R)
+- `pnl_r` = gross; `pnl_r_net = pnl_r - cost_r`
+- t1t2 mode: partial TP1 locks in 50% at T1; blending only if `partial_hit=True`
+
+**Deduplication:** `setup_id` = `direction + x_time + a_time + b_time + c_time + d_time` — prevents re-entry on the same wave as the window advances.
+
+**CSV output columns (key):**
+`setup_id · signal · direction · signal_bar · signal_time · signal_index · strategy_signal_time · exit_bar · exit_time · entry_price · stop_loss · target_1/2/3 · exit_price · exit_reason · pnl_r · cost_r · pnl_r_net · bars_held · rr_t1/t2 · bos_index · bos_price · reason · x/a/d_price · retracement · harmonic_valid · poc_price`
+
+**HTML report:** Gross vs Net summary table (Win Rate, Total R, EV, Profit Factor, Max DD) + execution assumptions table (entry model, SL/TP intrabar rule, position model, fee rate, slippage rate, round-trip cost).
+
+**Stats (`compute_stats`):** returns both gross keys (`win_rate`, `total_r`, `ev_per_trade`, `profit_factor`, `max_dd_r`) and net keys (`net_total_r`, `net_ev_per_trade`, `net_profit_factor`, `net_win_rate`, `net_max_dd_r`).
+
+### Data layer (`data.py`)
+
+- `get_top_symbols(n, min_turnover_usd)` — top USDT perpetuals by 24h turnover from Bybit v5 tickers
+- `fetch_candles(symbol, tf, end_time_ms, use_cache)` — 2 × 200 candle batches; saves to CSV cache
+- `fetch_candles_range(symbol, tf, start_ms, end_ms, use_cache)` — multi-batch historical fetch; reads CSV cache first
+- Returns DataFrame with `timestamp` as int64 ms — `normalize_ohlcv_dataframe()` converts to pd.Timestamp
+- Rate-limit handling: retCode 10002/10006/10018 → exponential backoff (up to 5 retries)
+- Cache path: `data/cache/{symbol}_{tf}_{YYYYMMDD}_{YYYYMMDD}.csv`
+
+### Shared utilities (`utils.py`)
+
+`normalize_timeframe(s)` — canonical form mapping:
+
+| Input | Output |
+|---|---|
+| `"1h"`, `"4h"` | `"1H"`, `"4H"` |
+| `"60"`, `"240"` | `"1H"`, `"4H"` |
+| `"15"`, `"30"` | `"15m"`, `"30m"` |
+| `"15m"`, `"1H"` | unchanged |
+
+### Unit tests
+
+```bash
+python -m pytest strategy_find_3rd_wave/tests/ -v
+```
+
+23 tests across: `TestNormalizeOhlcv` (6) · `TestLongSetup` (5) · `TestShortSetup` (1) · `TestRejectionReasons` (3) · `TestBOS` (3) · `TestLongDoesNotBlockShort` (1) · `TestSignalMetadata` (2) · `TestSetupId` (2)
+
+Key fixtures: `cfg_d_entry` uses `require_bos=False` for basic signal tests (entry at D avoids RR issues with synthetic data). BOS-specific tests are in `TestBOS` with `max_bars_after_bos=0`.
+
+### Important invariants
+
+- `signal_index` always refers to the trigger candle (BOS candle or D candle), never `as_of_index`
+- Backtest enters trades only when `result.signal_index == i` (exact candle match)
+- Scanner uses `analysis_price = df["close"].iloc[-1]` — never `sym_info["price"]` (live ticker)
+- `find_wave_structures()` returns all candidates sorted by score; `_evaluate_direction()` picks the highest-ranked signal across all of them
+- `swing.confirmed_index = i + swing_right` — pivots are never used before they are confirmed (no lookahead)

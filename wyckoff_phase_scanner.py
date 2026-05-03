@@ -13,7 +13,7 @@ import time
 import os
 import subprocess
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 OUTPUT_DIR = "output"
@@ -25,7 +25,23 @@ TIMEFRAMES = ["5m", "15m", "30m", "1H", "4H", "1D"]
 TF_LABEL   = {"5m": "5M", "15m": "15M", "30m": "30M", "1H": "1H", "4H": "4H", "1D": "1D"}
 TF_BYBIT   = {"5m": "5",  "15m": "15",  "30m": "30",  "1H": "60", "4H": "240", "1D": "D"}
 
-_SEMAPHORE = threading.Semaphore(20)
+_SEMAPHORE         = threading.Semaphore(20)
+_POLYGON_SEMAPHORE = threading.Semaphore(5)
+
+
+def _read_polygon_key():
+    env = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        with open(env) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("POLYGON_API_KEY="):
+                    return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return os.environ.get("POLYGON_API_KEY", "")
+
+POLYGON_API_KEY = _read_polygon_key()
 
 # ============================================================
 # DATA FETCHING
@@ -79,6 +95,72 @@ def get_top_symbols(n=400):
     usdt = [t for t in tickers if t["symbol"].endswith("USDT")]
     usdt.sort(key=lambda t: float(t.get("turnover24h", 0)), reverse=True)
     return [t["symbol"] for t in usdt[:n]]
+
+# ============================================================
+# POLYGON (STOCKS)
+# ============================================================
+
+_POLYGON_TF = {
+    "5m":  (5,  "minute"),
+    "15m": (15, "minute"),
+    "30m": (30, "minute"),
+    "1H":  (1,  "hour"),
+    "4H":  (4,  "hour"),
+    "1D":  (1,  "day"),
+}
+
+_POLYGON_LOOKBACK_DAYS = {
+    "5m":  15,
+    "15m": 30,
+    "30m": 60,
+    "1H":  110,
+    "4H":  450,
+    "1D":  650,
+}
+
+def get_candles_stock(symbol, interval, end_time_ms=None):
+    mult, timespan = _POLYGON_TF.get(interval, (1, "day"))
+    days    = _POLYGON_LOOKBACK_DAYS.get(interval, 120)
+    end_ms  = end_time_ms or int(time.time() * 1000)
+    from_ms = end_ms - days * 24 * 3600 * 1000
+    from_date = datetime.fromtimestamp(from_ms / 1000, timezone.utc).strftime("%Y-%m-%d")
+    to_date   = datetime.fromtimestamp(end_ms   / 1000, timezone.utc).strftime("%Y-%m-%d")
+    url     = (f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range"
+               f"/{mult}/{timespan}/{from_date}/{to_date}")
+    params  = {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": POLYGON_API_KEY}
+    for attempt in range(4):
+        try:
+            with _POLYGON_SEMAPHORE:
+                r = requests.get(url, params=params, timeout=20)
+            data = r.json()
+            if data.get("status") in ("OK", "DELAYED"):
+                raw = data.get("results") or []
+                candles = [
+                    {"time": c["t"] // 1000, "open": float(c["o"]), "high": float(c["h"]),
+                     "low": float(c["l"]), "close": float(c["c"]), "volume": float(c.get("v", 0))}
+                    for c in raw if isinstance(c, dict)
+                ]
+                return candles[-400:] if len(candles) > 400 else candles
+            if r.status_code == 429:
+                time.sleep(2 ** (attempt + 2))
+                continue
+            return []
+        except Exception:
+            time.sleep(2 ** attempt)
+    return []
+
+
+def get_stock_symbols(filepath):
+    symbols = []
+    try:
+        with open(filepath) as f:
+            for line in f:
+                sym = line.strip()
+                if sym and not sym.startswith("#"):
+                    symbols.append(sym)
+    except Exception as e:
+        print(f"Błąd odczytu pliku {filepath}: {e}")
+    return symbols
 
 # ============================================================
 # WYCKOFF ANALYSIS
@@ -593,6 +675,28 @@ def main():
     print("  Wyckoff Phase Scanner")
     print("=" * 55)
 
+    # ── Market selection ──
+    print("\nRynek:")
+    print("  c = Krypto (Bybit Top 400)")
+    print("  s = Stocki (lista z pliku)")
+    market = input("Wybierz (c/s): ").strip().lower()
+
+    if market == "s":
+        print("\nPlik symboli:")
+        print("  1 = stock_ftmo.txt")
+        print("  2 = stock_us.txt")
+        file_choice = input("Wybierz (1/2): ").strip()
+        _root = os.path.dirname(os.path.abspath(__file__))
+        stock_filename = "stock_ftmo.txt" if file_choice == "1" else "stock_us.txt"
+        stock_file     = os.path.join(_root, stock_filename)
+        fetch_fn       = get_candles_stock
+        max_scan_workers = 5
+    else:
+        market           = "c"
+        stock_file       = None
+        fetch_fn         = get_candles
+        max_scan_workers = 20
+
     # ── Single or multi condition ──
     n_raw = input("\nIle warunków? (Enter = 1): ").strip()
     try:
@@ -636,12 +740,20 @@ def main():
     report_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # ── Fetch symbols ──
-    print("\nPobieram Top 400 symboli...")
-    symbols = get_top_symbols(400)
-    if not symbols:
-        print("Nie udało się pobrać listy symboli. Sprawdź połączenie.")
-        return
-    print(f"  {len(symbols)} symboli.")
+    if market == "s":
+        print(f"\nWczytuję symbole z {stock_filename}...")
+        symbols = get_stock_symbols(stock_file)
+        if not symbols:
+            print("Brak symboli w pliku. Sprawdź ścieżkę.")
+            return
+        print(f"  {len(symbols)} symboli.")
+    else:
+        print("\nPobieram Top 400 symboli...")
+        symbols = get_top_symbols(400)
+        if not symbols:
+            print("Nie udało się pobrać listy symboli. Sprawdź połączenie.")
+            return
+        print(f"  {len(symbols)} symboli.")
 
     # ── Unique TFs needed for conditions ──
     condition_tfs = list(dict.fromkeys(c["tf"] for c in conditions))
@@ -654,8 +766,7 @@ def main():
 
     def _scan(sym):
         try:
-            # Fetch all condition TFs
-            data = {tf: get_candles(sym, tf, BACKTEST_TIME_MS) for tf in condition_tfs}
+            data = {tf: fetch_fn(sym, tf, BACKTEST_TIME_MS) for tf in condition_tfs}
             with lock:
                 progress["n"] += 1
                 if progress["n"] % 50 == 0:
@@ -673,7 +784,7 @@ def main():
             pass
         return None
 
-    with ThreadPoolExecutor(max_workers=20) as ex:
+    with ThreadPoolExecutor(max_workers=max_scan_workers) as ex:
         results = list(ex.map(_scan, symbols))
 
     candidates = [r for r in results if r is not None]
@@ -691,12 +802,13 @@ def main():
         def _fetch_rest(m):
             data = dict(m["data_cond_tfs"])
             for tf in remaining_tfs:
-                data[tf] = get_candles(m["symbol"], tf, BACKTEST_TIME_MS)
+                data[tf] = fetch_fn(m["symbol"], tf, BACKTEST_TIME_MS)
             m["data_by_tf"] = data
             print(f"  {m['symbol']} — OK")
             return m
 
-        with ThreadPoolExecutor(max_workers=6) as ex:
+        rest_workers = min(6, max_scan_workers)
+        with ThreadPoolExecutor(max_workers=rest_workers) as ex:
             candidates = list(ex.map(_fetch_rest, candidates))
     else:
         for m in candidates:
@@ -715,13 +827,14 @@ def main():
     scan_config = {"conditions": conditions, "total_scanned": len(symbols)}
     html = generate_html(candidates, scan_config, report_time, data_time, is_backtest)
 
-    cond_safe = "_".join(f'{c["tf"]}ph{"".join(c["phases"])}' for c in conditions)
-    ts_str    = datetime.now().strftime("%Y_%m_%d_%H%M")
+    cond_safe    = "_".join(f'{c["tf"]}ph{"".join(c["phases"])}' for c in conditions)
+    market_label = "stocks_" + os.path.splitext(stock_filename)[0] if market == "s" else "crypto"
+    ts_str       = datetime.now().strftime("%Y_%m_%d_%H%M")
     if is_backtest and BACKTEST_TIME_MS:
         bt_ts   = datetime.fromtimestamp(BACKTEST_TIME_MS / 1000).strftime("%Y_%m_%d_%H%M")
-        outfile = os.path.join(OUTPUT_DIR, f"wyckoff_{cond_safe}_{bt_ts}_bt.html")
+        outfile = os.path.join(OUTPUT_DIR, f"wyckoff_{market_label}_{cond_safe}_{bt_ts}_bt.html")
     else:
-        outfile = os.path.join(OUTPUT_DIR, f"wyckoff_{cond_safe}_{ts_str}.html")
+        outfile = os.path.join(OUTPUT_DIR, f"wyckoff_{market_label}_{cond_safe}_{ts_str}.html")
 
     with open(outfile, "w", encoding="utf-8") as f:
         f.write(html)

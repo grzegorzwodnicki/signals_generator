@@ -10,7 +10,7 @@ import requests
 import time
 import os
 import subprocess
-from datetime import datetime
+from datetime import datetime, timezone
 
 OUTPUT_DIR = "output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -63,6 +63,71 @@ def get_candles(symbol, interval, end_time_ms=None):
     oldest_ts = min(int(c[0]) for c in b1)
     b2 = _bybit_candles_raw(symbol, interval, 200, oldest_ts - 1)
     return _parse(b1 + b2)
+
+# ============================================================
+# POLYGON (STOCKS)
+# ============================================================
+
+def _read_polygon_key():
+    env = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    try:
+        with open(env) as f:
+            for line in f:
+                if line.strip().startswith("POLYGON_API_KEY="):
+                    return line.strip().split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return os.environ.get("POLYGON_API_KEY", "")
+
+POLYGON_API_KEY = _read_polygon_key()
+
+_POLYGON_TF = {
+    "5m":  (5,  "minute"),
+    "15m": (15, "minute"),
+    "30m": (30, "minute"),
+    "1H":  (1,  "hour"),
+    "4H":  (4,  "hour"),
+    "1D":  (1,  "day"),
+}
+
+_POLYGON_LOOKBACK_DAYS = {
+    "5m":  15,
+    "15m": 30,
+    "30m": 60,
+    "1H":  110,
+    "4H":  450,
+    "1D":  650,
+}
+
+def get_candles_stock(symbol, interval, end_time_ms=None):
+    mult, timespan = _POLYGON_TF.get(interval, (1, "day"))
+    days    = _POLYGON_LOOKBACK_DAYS.get(interval, 120)
+    end_ms  = end_time_ms or int(time.time() * 1000)
+    from_ms = end_ms - days * 24 * 3600 * 1000
+    from_date = datetime.fromtimestamp(from_ms / 1000, timezone.utc).strftime("%Y-%m-%d")
+    to_date   = datetime.fromtimestamp(end_ms   / 1000, timezone.utc).strftime("%Y-%m-%d")
+    url = (f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range"
+           f"/{mult}/{timespan}/{from_date}/{to_date}")
+    params = {"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": POLYGON_API_KEY}
+    for attempt in range(4):
+        try:
+            r = requests.get(url, params=params, timeout=20)
+            data = r.json()
+            if data.get("status") in ("OK", "DELAYED"):
+                raw = data.get("results") or []
+                candles = [
+                    {"time": c["t"] // 1000, "open": float(c["o"]), "high": float(c["h"]),
+                     "low": float(c["l"]), "close": float(c["c"]), "volume": float(c.get("v", 0))}
+                    for c in raw if isinstance(c, dict)
+                ]
+                return candles[-400:] if len(candles) > 400 else candles
+            if r.status_code == 429:
+                time.sleep(2 ** (attempt + 2))
+                continue
+            return []
+        except Exception:
+            time.sleep(2 ** attempt)
+    return []
 
 # ============================================================
 # HELPERS
@@ -1383,13 +1448,28 @@ def main():
     print("  Instrument Market Structure Analyzer")
     print("=" * 55)
 
-    symbol = input("\nPodaj symbol (np. BTC lub BTCUSDT): ").strip().upper()
-    if not symbol:
-        print("Brak symbolu. Koniec.")
-        return
-    if not symbol.endswith("USDT"):
-        symbol += "USDT"
-        print(f"  → {symbol}")
+    # ── Market selection ──
+    print("\nRynek:")
+    print("  c = Krypto (Bybit)")
+    print("  s = Stock  (Polygon)")
+    market = input("Wybierz (c/s): ").strip().lower()
+    is_stock = (market == "s")
+
+    if is_stock:
+        symbol = input("\nPodaj ticker (np. AAPL): ").strip().upper()
+        if not symbol:
+            print("Brak symbolu. Koniec.")
+            return
+        fetch_fn = get_candles_stock
+    else:
+        symbol = input("\nPodaj symbol (np. BTC lub BTCUSDT): ").strip().upper()
+        if not symbol:
+            print("Brak symbolu. Koniec.")
+            return
+        if not symbol.endswith("USDT"):
+            symbol += "USDT"
+            print(f"  → {symbol}")
+        fetch_fn = get_candles
 
     choice = input("Dane teraźniejsze czy historyczne? (t=teraz / h=historyczne): ").strip().lower()
     is_backtest = False
@@ -1414,12 +1494,13 @@ def main():
     data_by_tf = {}
     for tf in TIMEFRAMES:
         print(f"  {TF_LABEL[tf]}...", end=" ", flush=True)
-        candles = get_candles(symbol, tf, BACKTEST_TIME_MS)
+        candles = fetch_fn(symbol, tf, BACKTEST_TIME_MS)
         data_by_tf[tf] = candles
         print(f"{len(candles)} świec")
 
     if not any(data_by_tf.values()):
-        print(f"\nBrak danych dla {symbol}. Sprawdź czy symbol istnieje na Bybit Linear.")
+        src = "Polygon" if is_stock else "Bybit Linear"
+        print(f"\nBrak danych dla {symbol}. Sprawdź czy ticker istnieje w {src}.")
         return
 
     print("\nGeneruję raport...")

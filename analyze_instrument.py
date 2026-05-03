@@ -138,13 +138,19 @@ def analyze_wyckoff(candles):
     recent_tnd  = trend(candles, min(15, len(candles)))
     ranging     = is_ranging(candles[-30:] if len(candles) > 30 else candles, min(30, len(candles)))
 
-    tail  = candles[-15:]
-    prev  = candles[-50:-10] if len(candles) > 60 else candles[:-10]
+    tail_sos = candles[-15:]    # recent window: fresh SOS/SOW
+    tail_phc = candles[-25:]    # wider window: Spring/UTAD may precede SOS by several bars
 
-    sos    = any(c["close"] > rh and c["close"] > c["open"] for c in tail)
-    sow    = any(c["close"] < rl and c["close"] < c["open"] for c in tail)
-    spring = any(c["low"] < rl and c["close"] > rl for c in tail)
-    utad   = any(c["high"] > rh and c["close"] < rh for c in tail)
+    # Last-wins for SOS/SOW
+    sos_last = max((i for i, c in enumerate(tail_sos)
+                    if c["close"] > rh and c["close"] > c["open"]), default=-1)
+    sow_last = max((i for i, c in enumerate(tail_sos)
+                    if c["close"] < rl and c["close"] < c["open"]), default=-1)
+    sos = sos_last >= 0
+    sow = sow_last >= 0
+
+    spring = any(c["low"] < rl and c["close"] > rl for c in tail_phc)
+    utad   = any(c["high"] > rh and c["close"] < rh for c in tail_phc)
 
     # Volume climax
     if len(candles) >= 10:
@@ -170,19 +176,30 @@ def analyze_wyckoff(candles):
     if not events:
         events.append("No clear Wyckoff events")
 
-    # Struktura i faza
-    if sos and not sow:
+    # Phase D: SOS or SOW (most recent wins when both present)
+    if sos and (not sow or sos_last >= sow_last):
         structure  = "Accumulation" if full_trend in ("bearish","neutral") else "Reaccumulation"
-        phase      = "D" if (lps or sos) else ("C" if spring else ("B" if ranging else "Unclear"))
+        phase      = "D"
         confidence = "HIGH" if (spring and lps) else ("MEDIUM" if (spring or lps) else "LOW")
-    elif sow and not sos:
+    elif sow and (not sos or sow_last > sos_last):
         structure  = "Distribution" if full_trend in ("bullish","neutral") else "Redistribution"
-        phase      = "D" if (lpsy or sow) else ("C" if utad else ("B" if ranging else "Unclear"))
+        phase      = "D"
         confidence = "HIGH" if (utad and lpsy) else ("MEDIUM" if (utad or lpsy) else "LOW")
+    # Phase C: Spring or UTAD fired but no breakout yet
+    elif spring and not sow:
+        structure  = "Accumulation" if full_trend in ("bearish","neutral") else "Reaccumulation"
+        phase      = "C"
+        confidence = "MEDIUM"
+    elif utad and not sos:
+        structure  = "Distribution" if full_trend in ("bullish","neutral") else "Redistribution"
+        phase      = "C"
+        confidence = "MEDIUM"
+    # Phase B: ranging
     elif ranging:
         structure  = "Accumulation" if full_trend == "bearish" else ("Distribution" if full_trend == "bullish" else "UNCLEAR")
         phase      = "B"
         confidence = "LOW"
+    # Phase E: trending
     else:
         structure  = "Trend (Bullish)" if full_trend == "bullish" else ("Trend (Bearish)" if full_trend == "bearish" else "UNCLEAR")
         phase      = "E" if full_trend != "unclear" else "Unclear"
@@ -293,8 +310,8 @@ def analyze_liquidity(candles, tol=0.003):
     if not any(abs(x["level"] - rl) / rl <= tol for x in below):
         below.append({"level": rl, "count": 1, "type": "Period Low", "score": 6})
 
-    above.sort(key=lambda x: x["level"], reverse=True)
-    below.sort(key=lambda x: x["level"], reverse=True)
+    above.sort(key=lambda x: x["level"])               # ascending: closest above price first
+    below.sort(key=lambda x: x["level"], reverse=True) # descending: closest below price first
 
     eq_h = [x for x in cl_h if x["count"] >= 2]
     eq_l = [x for x in cl_l if x["count"] >= 2]
@@ -770,7 +787,7 @@ def find_harmonic_patterns(candles, tol=0.07):
         ab = abs(B["price"] - A["price"])
         bc = abs(C["price"] - B["price"])
         cd = abs(D["price"] - C["price"])
-        ad = abs(D["price"] - X["price"])
+        ad = abs(D["price"] - A["price"])   # AD leg (A→D), not XD
 
         if xa < 1e-9 or ab < 1e-9 or bc < 1e-9 or cd < 1e-9:
             continue
@@ -1242,10 +1259,9 @@ def generate_report(symbol, data_by_tf, report_time, data_time, is_backtest):
         st = a.get("structure", {})
         interp.append(f'{TF_LABEL[tf]}: <strong>{w["structure"]}</strong> Phase {w["phase"]} ({w["confidence"]} confidence).')
         if st.get("choch"):
-            interp.append("ChoCH detected — potential character change.")
+            interp.append(f'{TF_LABEL[tf]}: ChoCH detected — potential character change.')
         if st.get("bos"):
-            interp.append("BOS confirmed — structure continuation in mid-term direction.")
-        break
+            interp.append(f'{TF_LABEL[tf]}: BOS confirmed — structure continuation in mid-term direction.')
 
     if market_state in ("BULLISH","BEARISH"):
         interp.append(f'Cross-timeframe alignment is <strong style="color:{state_col}">{market_state}</strong>.')

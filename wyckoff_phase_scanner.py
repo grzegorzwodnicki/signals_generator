@@ -134,12 +134,19 @@ def analyze_wyckoff(candles):
     recent_tnd = _trend(candles, min(15, len(candles)))
     ranging    = _ranging(candles[-30:] if len(candles) > 30 else candles, min(30, len(candles)))
 
-    tail = candles[-15:]
+    tail_sos = candles[-15:]    # recent window: fresh SOS/SOW breakouts
+    tail_phc = candles[-25:]    # wider window: Spring/UTAD may precede SOS by several bars
 
-    sos    = any(c["close"] > rh and c["close"] > c["open"] for c in tail)
-    sow    = any(c["close"] < rl and c["close"] < c["open"] for c in tail)
-    spring = any(c["low"] < rl and c["close"] > rl for c in tail)
-    utad   = any(c["high"] > rh and c["close"] < rh for c in tail)
+    # Last-wins for SOS/SOW — prevents both firing and cancelling each other
+    sos_last = max((i for i, c in enumerate(tail_sos)
+                    if c["close"] > rh and c["close"] > c["open"]), default=-1)
+    sow_last = max((i for i, c in enumerate(tail_sos)
+                    if c["close"] < rl and c["close"] < c["open"]), default=-1)
+    sos = sos_last >= 0
+    sow = sow_last >= 0
+
+    spring = any(c["low"] < rl and c["close"] > rl for c in tail_phc)
+    utad   = any(c["high"] > rh and c["close"] < rh for c in tail_phc)
 
     if len(candles) >= 10:
         win = candles[-50:] if len(candles) > 50 else candles
@@ -164,19 +171,31 @@ def analyze_wyckoff(candles):
     if not events:
         events.append("No clear events")
 
-    if sos and not sow:
+    # Phase D: SOS or SOW breakout (most recent wins when both present)
+    if sos and (not sow or sos_last >= sow_last):
         structure  = "Accumulation" if full_trend in ("bearish", "neutral") else "Reaccumulation"
-        phase      = "D" if (lps or sos) else ("C" if spring else ("B" if ranging else "Unclear"))
+        phase      = "D"
         confidence = "HIGH" if (spring and lps) else ("MEDIUM" if (spring or lps) else "LOW")
-    elif sow and not sos:
+    elif sow and (not sos or sow_last > sos_last):
         structure  = "Distribution" if full_trend in ("bullish", "neutral") else "Redistribution"
-        phase      = "D" if (lpsy or sow) else ("C" if utad else ("B" if ranging else "Unclear"))
+        phase      = "D"
         confidence = "HIGH" if (utad and lpsy) else ("MEDIUM" if (utad or lpsy) else "LOW")
+    # Phase C: Spring or UTAD fired but no breakout yet
+    elif spring and not sow:
+        structure  = "Accumulation" if full_trend in ("bearish", "neutral") else "Reaccumulation"
+        phase      = "C"
+        confidence = "MEDIUM"
+    elif utad and not sos:
+        structure  = "Distribution" if full_trend in ("bullish", "neutral") else "Redistribution"
+        phase      = "C"
+        confidence = "MEDIUM"
+    # Phase B: price ranging inside the zone
     elif ranging:
-        structure  = "Accumulation" if full_trend == "bearish" else (
-                     "Distribution" if full_trend == "bullish" else "UNCLEAR")
+        structure  = ("Accumulation" if full_trend == "bearish" else
+                      "Distribution" if full_trend == "bullish" else "UNCLEAR")
         phase      = "B"
         confidence = "LOW"
+    # Phase E: trending
     else:
         structure  = ("Trend (Bullish)" if full_trend == "bullish" else
                       "Trend (Bearish)" if full_trend == "bearish" else "UNCLEAR")

@@ -11,15 +11,19 @@ import time
 import os
 import subprocess
 from datetime import datetime, timezone
+from wyckoff_core import analyze_wyckoff as _analyze_wyckoff_core
+
+def analyze_wyckoff(candles):
+    return _analyze_wyckoff_core(candles, verbose=True)
 
 OUTPUT_DIR = "output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 BACKTEST_TIME_MS = None
 
-TIMEFRAMES   = ["5m", "15m", "30m", "1H", "4H", "1D"]
-TF_LABEL     = {"5m": "5M", "15m": "15M", "30m": "30M", "1H": "1H", "4H": "4H", "1D": "1D"}
-TF_BYBIT     = {"5m": "5",  "15m": "15",  "30m": "30",  "1H": "60", "4H": "240", "1D": "D"}
+TIMEFRAMES   = ["5m", "15m", "30m", "1H", "4H", "1D", "1W"]
+TF_LABEL     = {"5m": "5M", "15m": "15M", "30m": "30M", "1H": "1H", "4H": "4H", "1D": "1D", "1W": "1W"}
+TF_BYBIT     = {"5m": "5",  "15m": "15",  "30m": "30",  "1H": "60", "4H": "240", "1D": "D", "1W": "W"}
 
 # ============================================================
 # DATA FETCHING
@@ -88,6 +92,7 @@ _POLYGON_TF = {
     "1H":  (1,  "hour"),
     "4H":  (4,  "hour"),
     "1D":  (1,  "day"),
+    "1W":  (1,  "week"),
 }
 
 _POLYGON_LOOKBACK_DAYS = {
@@ -97,6 +102,7 @@ _POLYGON_LOOKBACK_DAYS = {
     "1H":  110,
     "4H":  450,
     "1D":  650,
+    "1W":  1400,
 }
 
 def get_candles_stock(symbol, interval, end_time_ms=None):
@@ -172,115 +178,6 @@ def trend(candles, lookback=30):
     if s < f * 0.985:  return "bearish"
     return "neutral"
 
-def is_ranging(candles, lookback=30, thr=0.06):
-    if len(candles) < lookback:
-        return False
-    src = candles[-lookback:]
-    rng = max(c["high"] for c in src) - min(c["low"] for c in src)
-    avg = sum(c["close"] for c in src) / lookback
-    return avg > 0 and rng / avg < thr
-
-# ============================================================
-# WYCKOFF ANALYSIS
-# ============================================================
-
-def analyze_wyckoff(candles):
-    if not candles or len(candles) < 20:
-        return {"structure":"UNCLEAR","phase":"Unclear","events":["Insufficient data"],"confidence":"LOW",
-                "range_high":None,"range_low":None,"full_trend":"unclear","recent_trend":"unclear","ranging":False}
-
-    src = candles[-80:] if len(candles) > 80 else candles
-    n   = len(src)
-
-    # Percentyl 80/20 jako range high/low
-    all_h = sorted(c["high"] for c in src)
-    all_l = sorted(c["low"]  for c in src)
-    rh = all_h[int(n * 0.82)]
-    rl = all_l[int(n * 0.18)]
-
-    last        = candles[-1]["close"]
-    full_trend  = trend(candles, min(60, len(candles)))
-    recent_tnd  = trend(candles, min(15, len(candles)))
-    ranging     = is_ranging(candles[-30:] if len(candles) > 30 else candles, min(30, len(candles)))
-
-    tail_sos = candles[-15:]    # recent window: fresh SOS/SOW
-    tail_phc = candles[-25:]    # wider window: Spring/UTAD may precede SOS by several bars
-
-    # Last-wins for SOS/SOW
-    sos_last = max((i for i, c in enumerate(tail_sos)
-                    if c["close"] > rh and c["close"] > c["open"]), default=-1)
-    sow_last = max((i for i, c in enumerate(tail_sos)
-                    if c["close"] < rl and c["close"] < c["open"]), default=-1)
-    sos = sos_last >= 0
-    sow = sow_last >= 0
-
-    spring = any(c["low"] < rl and c["close"] > rl for c in tail_phc)
-    utad   = any(c["high"] > rh and c["close"] < rh for c in tail_phc)
-
-    # Volume climax
-    if len(candles) >= 10:
-        win = candles[-50:] if len(candles) > 50 else candles
-        mvc = max(win, key=lambda c: c["volume"])
-        sc  = mvc["close"] < mvc["open"] and mvc["low"]  <= rl * 1.005
-        bc  = mvc["close"] > mvc["open"] and mvc["high"] >= rh * 0.995
-    else:
-        sc = bc = False
-
-    lps  = sos and last <= rh * 1.015 and last >= rl
-    lpsy = sow and last >= rl * 0.985 and last <= rh
-
-    events = []
-    if sc:     events.append("Possible SC (Selling Climax)")
-    if bc:     events.append("Possible BC (Buying Climax)")
-    if spring: events.append("Spring (test below support)")
-    if utad:   events.append("UTAD (test above resistance)")
-    if sos:    events.append("SOS — break above range high")
-    if sow:    events.append("SOW — break below range low")
-    if lps:    events.append("LPS — pullback after SOS")
-    if lpsy:   events.append("LPSY — pullback after SOW")
-    if not events:
-        events.append("No clear Wyckoff events")
-
-    # Phase D: SOS or SOW (most recent wins when both present)
-    if sos and (not sow or sos_last >= sow_last):
-        structure  = "Accumulation" if full_trend in ("bearish","neutral") else "Reaccumulation"
-        phase      = "D"
-        confidence = "HIGH" if (spring and lps) else ("MEDIUM" if (spring or lps) else "LOW")
-    elif sow and (not sos or sow_last > sos_last):
-        structure  = "Distribution" if full_trend in ("bullish","neutral") else "Redistribution"
-        phase      = "D"
-        confidence = "HIGH" if (utad and lpsy) else ("MEDIUM" if (utad or lpsy) else "LOW")
-    # Phase C: Spring or UTAD fired but no breakout yet
-    elif spring and not sow:
-        structure  = "Accumulation" if full_trend in ("bearish","neutral") else "Reaccumulation"
-        phase      = "C"
-        confidence = "MEDIUM"
-    elif utad and not sos:
-        structure  = "Distribution" if full_trend in ("bullish","neutral") else "Redistribution"
-        phase      = "C"
-        confidence = "MEDIUM"
-    # Phase B: ranging
-    elif ranging:
-        structure  = "Accumulation" if full_trend == "bearish" else ("Distribution" if full_trend == "bullish" else "UNCLEAR")
-        phase      = "B"
-        confidence = "LOW"
-    # Phase E: trending
-    else:
-        structure  = "Trend (Bullish)" if full_trend == "bullish" else ("Trend (Bearish)" if full_trend == "bearish" else "UNCLEAR")
-        phase      = "E" if full_trend != "unclear" else "Unclear"
-        confidence = "MEDIUM" if full_trend != "unclear" else "LOW"
-
-    return {
-        "structure":    structure,
-        "phase":        phase,
-        "events":       events,
-        "confidence":   confidence,
-        "range_high":   rh,
-        "range_low":    rl,
-        "full_trend":   full_trend,
-        "recent_trend": recent_tnd,
-        "ranging":      ranging,
-    }
 
 # ============================================================
 # LIQUIDITY

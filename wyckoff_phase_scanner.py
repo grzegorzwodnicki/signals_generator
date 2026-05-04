@@ -262,6 +262,15 @@ STRUCT_COLOR = {
 CONF_COLOR = {"HIGH": "#00ff8c", "MEDIUM": "#ffd700", "LOW": "#8899aa"}
 CONF_RANK  = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}
 
+def _range_label(structure, rh_val, rl_val):
+    """Return SC/AR or BC/AR label for accumulation/distribution; plain range otherwise."""
+    s = structure or ""
+    if "Accumulation" in s or "Reaccumulation" in s:
+        return f"SC {rl_val} / AR {rh_val}"
+    if "Distribution" in s or "Redistribution" in s:
+        return f"BC {rh_val} / AR {rl_val}"
+    return f"{rl_val} — {rh_val}"
+
 def _multi_tf_table(data_by_tf, highlight_tfs=None):
     hl_set = set(highlight_tfs) if highlight_tfs else set()
     rows = ""
@@ -285,7 +294,7 @@ def _multi_tf_table(data_by_tf, highlight_tfs=None):
             f'<td style="color:#88ccff;font-weight:bold;white-space:nowrap">{TF_LABEL[tf]}</td>'
             f'<td style="color:{sc}">{w["structure"]}</td>'
             f'<td style="color:#ffd700;white-space:nowrap">Phase {w["phase"]}</td>'
-            f'<td style="color:#00e5ff;white-space:nowrap;font-size:12px">{rl} — {rh}</td>'
+            f'<td style="color:#00e5ff;white-space:nowrap;font-size:12px">{_range_label(w["structure"], rh, rl)}</td>'
             f'<td style="font-size:11px;color:#8899aa;max-width:300px">{evs}</td>'
             f'<td style="color:{cc};white-space:nowrap;font-size:12px">{w["confidence"]}</td>'
             f'</tr>'
@@ -296,7 +305,7 @@ def _multi_tf_table(data_by_tf, highlight_tfs=None):
         '<th style="padding:5px 6px;color:#334455;text-align:left">TF</th>'
         '<th style="color:#334455">Structure</th>'
         '<th style="color:#334455">Phase</th>'
-        '<th style="color:#334455">Range (Low — High)</th>'
+        '<th style="color:#334455">SC/AR · BC/AR · Range</th>'
         '<th style="color:#334455">Key Events</th>'
         '<th style="color:#334455">Conf</th>'
         f'</tr></thead><tbody style="color:#e6edf7">{rows}</tbody></table>'
@@ -379,7 +388,7 @@ def generate_html(matches, scan_config, report_time, data_time, is_backtest):
             f'<td style="color:{sc}">{w["structure"]}</td>'
             f'<td style="color:#ffd700">Phase {w["phase"]}</td>'
             f'<td style="color:#00e5ff;white-space:nowrap;font-size:12px">'
-            f'{_f(w["range_low"])} — {_f(w["range_high"])}</td>'
+            f'{_range_label(w["structure"], _f(w["range_high"]), _f(w["range_low"]))}</td>'
             f'<td style="font-size:12px;color:#8899aa">{evs}</td>'
             f'<td style="color:{cc}">{w["confidence"]}</td>'
             f'</tr>'
@@ -396,7 +405,7 @@ def generate_html(matches, scan_config, report_time, data_time, is_backtest):
         '<table style="width:100%;border-collapse:collapse;font-size:13px">'
         '<thead style="background:#0d1520"><tr>'
         '<th>Symbol</th><th>Structure</th><th>Phase</th>'
-        '<th>Range on selected TF</th><th>Key Events</th><th>Conf</th>'
+        '<th>SC/AR · BC/AR · Range</th><th>Key Events</th><th>Conf</th>'
         '</tr></thead>'
         f'<tbody style="color:#e6edf7">{table_rows}</tbody>'
         '</table></div>'
@@ -430,7 +439,7 @@ def generate_html(matches, scan_config, report_time, data_time, is_backtest):
                     f'<span style="margin-right:16px;font-size:12px">'
                     f'<span style="color:#667788">{TF_LABEL.get(ctf, ctf)} Ph{"/".join(cond["phases"])}: </span>'
                     f'<span style="color:{csc}">{cwy["structure"]}</span>'
-                    f' <span style="color:#00e5ff">{_f(cwy["range_low"])} — {_f(cwy["range_high"])}</span>'
+                    f' <span style="color:#00e5ff">{_range_label(cwy["structure"], _f(cwy["range_high"]), _f(cwy["range_low"]))}</span>'
                     f'</span>'
                 )
 
@@ -452,7 +461,7 @@ def generate_html(matches, scan_config, report_time, data_time, is_backtest):
             f'<div>'
             f'<div style="margin-bottom:10px;flex-wrap:wrap">'
             f'{cond_ranges if multi_mode else ""}'
-            f'{"<span style=font-size:12px;color:#667788>Range (" + TF_LABEL.get(primary_tf, primary_tf) + "): </span><span style=color:#00e5ff;font-size:13px>" + _f(w["range_low"]) + " — " + _f(w["range_high"]) + "</span>" if not multi_mode else ""}'
+            f'{"<span style=font-size:12px;color:#667788>" + TF_LABEL.get(primary_tf, primary_tf) + ": </span><span style=color:#00e5ff;font-size:13px>" + _range_label(w["structure"], _f(w["range_high"]), _f(w["range_low"])) + "</span>" if not multi_mode else ""}'
             f'</div>'
             f'<div style="margin-bottom:14px">{ev_badges}</div>'
             f'{multi_tf}'

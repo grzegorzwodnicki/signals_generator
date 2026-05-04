@@ -32,10 +32,53 @@ Frozen v9.4 baseline. Do not modify — used as comparison point for v9.5 work.
 
 Same file structure as v9.5. Scanner output goes to `strategy_wyckoff_9_4/output/`. Exception: v9.4 scanner has a "Top Watchlist Manual Review Candidates" section added by explicit request — this is the only intentional post-freeze modification.
 
+### Shared Wyckoff core — `wyckoff_core.py`
+
+Shared module imported by **both** `analyze_instrument.py` and `wyckoff_phase_scanner.py`. Single source of truth for Wyckoff market-structure analysis. Do **not** duplicate or modify the analysis logic in the consumer scripts — edit `wyckoff_core.py` only.
+
+```python
+from wyckoff_core import analyze_wyckoff
+result = analyze_wyckoff(candles, verbose=False)
+# returns: structure, phase, events, confidence, range_high, range_low,
+#          full_trend, recent_trend, ranging
+```
+
+- `verbose=False` → short scanner labels (`"SOS"`, `"Spring"`, …)
+- `verbose=True` → descriptive labels (`"SOS — break above range high"`, …) — used by `analyze_instrument.py`
+
+**Tuning constants (all at module top — edit here, never inline):**
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `RANGE_SPAN_MAX` | 0.20 | `(high−low)/avg` must be < this for a range window |
+| `RANGE_SLOPE_MAX` | 0.008 | `\|linreg slope\| / mean_price` per bar must be < this |
+| `RANGE_SPAN_GROW_MAX` | 1.5 | span growth >50% + above floor → natural boundary |
+| `RANGE_SPAN_FLOOR` | 0.05 | minimum span before growth heuristic activates |
+| `RANGE_BOUNDS_DRIFT` | 0.03 | bounds may not drift >3% of avg from initial-window bounds |
+| `SPRING_HEIGHT_RATIO` | 0.20 | spring/UTAD pierce ≥ 20% of range height |
+| `SPRING_PIERCE_MIN` | 0.002 | absolute pierce floor (0.2% of price) |
+| `SOS_SOW_BUFFER` | 0.002 | SOS: `close > rh × 1.002`; SOW: `close < rl × 0.998` |
+| `SC_BC_VOL_MULT` | 2.0 | SC/BC: peak volume ≥ 2× rolling mean |
+| `_RANGE_WIN_MIN/_MAX` | 10/40 | adaptive window search range |
+| `_TAIL_WIN` | 15 | tail window for SOS/SOW/Spring/UTAD detection |
+| `_MIN_CANDLES` | 30 | minimum candles; fewer → returns `Insufficient` |
+
+**`_find_range_window` algorithm (v5):** grows from `_RANGE_WIN_MIN` → `_RANGE_WIN_MAX`, stopping at the **natural range boundary** via three complementary checks:
+1. Hard threshold: span ≥ `RANGE_SPAN_MAX` or slope ≥ `RANGE_SLOPE_MAX`
+2. Sharp transition: span jump > 50% of previous AND span > 5% floor (catches sudden entries into trend)
+3. Gradual contamination: cumulative bounds drift > 3% of avg from the smallest valid window (catches markdown/markup bleeding in candle-by-candle)
+
+**SC/BC window:** searched in `pre_tail[-_TAIL_WIN:]` (the 15 candles at the end of the consolidation), NOT in the breakout tail. This prevents the high-volume SOS/SOW candle from being mislabelled as BC/SC. Correct co-occurrence: `SC + SOS` is valid; `BC + SOS` is not.
+
+**Phase B:** fires on `ranging` (current 30-bar window is tight) only — not `has_range or ranging`. `has_range` without current tightness means the structure has broken out; falls through to Trend/Unclear.
+
+**Confidence:** graduated caps via `_CONF_CAPS` — `n < 45` → LOW, `n < 70` → MEDIUM, `n ≥ 70` → unrestricted.
+
 ### Legacy / other files
 - **`research/backtest.py`** — old backtest, now orphaned
 - **`fetch_and_zip_crypto.py`** + **`prompt_crypto_intradays_9_1.txt`** — Approach B: data fetch + LLM prompt workflow
-- **`analyze_instrument.py`** — single-instrument market structure report (no trade signals)
+- **`analyze_instrument.py`** — single-instrument market structure report (no trade signals); imports `wyckoff_core.analyze_wyckoff` with `verbose=True`
+- **`wyckoff_phase_scanner.py`** — multi-timeframe Wyckoff phase scanner; imports `wyckoff_core.analyze_wyckoff` with `verbose=False`; timeframes: `5m / 15m / 30m / 1H / 4H / 1D / 1W`
 - **`clean_output.py`** — removes files from `output/`, `strategy_wyckoff_9_5/output/`, `strategy_wyckoff_9_4/output/`, `results/`, `cache/` (`--dry-run`, `--cache` flags)
 
 ## Environment setup
@@ -406,7 +449,7 @@ Raw data dicts include a `_turnover` float key — always filter with `isinstanc
 
 ## Single-instrument analysis (`analyze_instrument.py`)
 
-Fetches 400 candles across 5M / 15M / 30M / 1H / 4H / 1D and produces a market-structure report (no trade signals).
+Fetches 400 candles across 5M / 15M / 30M / 1H / 4H / 1D / **1W** and produces a market-structure report (no trade signals).
 
 ```bash
 source venv/bin/activate
@@ -415,6 +458,8 @@ python analyze_instrument.py
 
 Interactive: symbol (auto-appends `USDT`) · `t` (live) or `h` (`dd/mm/yyyy hh:mm`).
 Output: `output/analysis_{SYMBOL}_{TIMESTAMP}.html`, auto-opens Chrome.
+
+Wyckoff analysis delegates to `wyckoff_core.analyze_wyckoff(candles, verbose=True)` — descriptive event labels. Do not modify the Wyckoff logic in this file; edit `wyckoff_core.py`.
 
 **`analyze_liquidity()` — enhanced level detection:**
 - Lookback 150 candles; three swing windows lb=3/5/8 (minor/intermediate/major)

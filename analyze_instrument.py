@@ -782,6 +782,15 @@ def find_harmonic_patterns(candles, tol=0.07):
 
     return patterns
 
+def _range_label(structure, rh_val, rl_val):
+    """Return SC/AR or BC/AR label for accumulation/distribution; plain range otherwise."""
+    s = structure or ""
+    if "Accumulation" in s or "Reaccumulation" in s:
+        return f"SC {rl_val} / AR {rh_val}"
+    if "Distribution" in s or "Redistribution" in s:
+        return f"BC {rh_val} / AR {rl_val}"
+    return f"{rl_val} — {rh_val}"
+
 # ============================================================
 # DATA FRESHNESS
 # ============================================================
@@ -913,7 +922,7 @@ def generate_report(symbol, data_by_tf, report_time, data_time, is_backtest):
               else "#ffd700")
         rh_str    = _f(w["range_high"]) if w["range_high"] else "N/A"
         rl_str    = _f(w["range_low"])  if w["range_low"]  else "N/A"
-        range_str = f'{rl_str} — {rh_str}'
+        range_str = _range_label(w["structure"], rh_str, rl_str)
         wy_rows += (f'<tr><td style="font-weight:bold">{TF_LABEL[tf]}</td>'
                     f'<td style="color:{sc}">{w["structure"]}</td>'
                     f'<td>Phase {w["phase"]}</td>'
@@ -925,7 +934,7 @@ def generate_report(symbol, data_by_tf, report_time, data_time, is_backtest):
         '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:13px">'
         '<thead style="background:#0d1520"><tr>'
         '<th style="padding:8px;color:#8899aa;text-align:left">TF</th>'
-        '<th>Structure</th><th>Phase</th><th style="white-space:nowrap">Range (Low — High)</th><th>Key Events</th><th>Confidence</th>'
+        '<th>Structure</th><th>Phase</th><th style="white-space:nowrap">SC/AR · BC/AR · Range</th><th>Key Events</th><th>Confidence</th>'
         f'</tr></thead><tbody style="color:#e6edf7">{wy_rows}</tbody></table></div>'
     )
 

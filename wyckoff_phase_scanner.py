@@ -271,6 +271,100 @@ def _range_label(structure, rh_val, rl_val):
         return f"BC {rh_val} / AR {rl_val}"
     return f"{rl_val} — {rh_val}"
 
+
+def _rsi_vol_cells(w, candles):
+    """Return (rsi_str, rsi_col, vol_str, vol_col) from analyze_wyckoff result + candles."""
+    pts     = w.get("_points") or {}
+    rsi_arr = pts.get("rsi", [])
+    vsma    = pts.get("vol_sma", [])
+
+    last_rsi = next((r for r in reversed(rsi_arr) if r is not None), None)
+    if last_rsi is not None:
+        rsi_str = f"{last_rsi:.1f}"
+        rsi_col = "#00ff8c" if last_rsi > 70 else ("#ff4d4d" if last_rsi < 30 else "#ffd700")
+    else:
+        rsi_str, rsi_col = "N/A", "#8899aa"
+
+    last_vsma = next((v for v in reversed(vsma) if v is not None), None)
+    last_vol  = candles[-1]["volume"] if candles else None
+    if last_vol is not None and last_vsma and last_vsma > 0:
+        vr      = last_vol / last_vsma
+        vol_str = f"{vr:.2f}×"
+        vol_col = "#00ff8c" if vr >= 1.5 else ("#ffd700" if vr >= 0.8 else "#ff8844")
+    else:
+        vol_str, vol_col = "N/A", "#8899aa"
+
+    return rsi_str, rsi_col, vol_str, vol_col
+
+
+def _wyckoff_points_panel(w, candles=None):
+    """Badges showing detected Wyckoff event points with RSI and Vol/SMA values."""
+    pts = w.get("_points") or {}
+    ctx = pts.get("context", "")
+    is_acc = ctx == "accumulation"
+    is_dist = ctx == "distribution"
+    if not (is_acc or is_dist):
+        return ""
+
+    events   = pts["acc"] if is_acc else pts["dist"]
+    pt_order = (["SC", "AR", "ST", "Spring", "SOS", "LPS"] if is_acc
+                else ["BC", "AR", "ST", "UTAD", "SOW", "LPSY"])
+    vsma     = pts.get("vol_sma", [])
+    _TIME_KEYS = {"SC", "BC", "AR"}
+
+    items = ""
+    for key in pt_order:
+        pt = events.get(key)
+        if not pt:
+            continue
+        idx     = pt.get("idx", 0)
+        price   = pt.get("price", 0)
+        rsi_val = pt.get("rsi")
+        vol     = pt.get("volume", 0)
+        vsma_v  = vsma[idx] if idx < len(vsma) and vsma[idx] is not None else None
+
+        rsi_str = f"{rsi_val:.1f}" if rsi_val is not None else "—"
+        rsi_col = ("#00ff8c" if (rsi_val or 50) > 70
+                   else "#ff4d4d" if (rsi_val or 50) < 30 else "#ffd700")
+        if vsma_v and vsma_v > 0:
+            vr      = vol / vsma_v
+            vol_str = f"{vr:.1f}×"
+            vol_col = "#00ff8c" if vr >= 1.5 else ("#ffd700" if vr >= 0.8 else "#ff8844")
+        else:
+            vol_str, vol_col = "—", "#8899aa"
+
+        pt_col = "#00ff8c" if is_acc else "#ff4d4d"
+        marker = ""
+        if pt.get("low_volume"):  marker = " ↓v"
+        if pt.get("high_volume"): marker = " ↑v"
+
+        time_badge = ""
+        if key in _TIME_KEYS and candles and idx < len(candles):
+            ts = candles[idx].get("time")
+            if ts:
+                dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                time_badge = f'<span style="color:#667788;font-size:10px">{dt.strftime("%d/%m %H:%M")}</span>'
+
+        items += (
+            f'<span style="background:#0d1520;border:1px solid #1e3050;border-radius:4px;'
+            f'padding:3px 8px;display:inline-flex;gap:5px;align-items:center;margin:2px;white-space:nowrap">'
+            f'<span style="color:{pt_col};font-weight:bold;font-size:11px">{key}{marker}</span>'
+            f'<span style="color:#e6edf7;font-size:11px">{_f(price)}</span>'
+            f'{time_badge}'
+            f'<span style="color:{rsi_col};font-size:10px">RSI {rsi_str}</span>'
+            f'<span style="color:{vol_col};font-size:10px">Vol {vol_str}</span>'
+            f'</span>'
+        )
+    if not items:
+        return ""
+    return (
+        f'<div style="margin:6px 0 10px;padding:7px;background:#070d18;border-radius:4px">'
+        f'<div style="font-size:10px;color:#445566;margin-bottom:5px">'
+        f'WYCKOFF POINTS — RSI(14) · Vol/SMA(20) · ↓v low vol · ↑v high vol</div>'
+        f'{items}</div>'
+    )
+
+
 def _multi_tf_table(data_by_tf, highlight_tfs=None):
     hl_set = set(highlight_tfs) if highlight_tfs else set()
     rows = ""
@@ -279,7 +373,7 @@ def _multi_tf_table(data_by_tf, highlight_tfs=None):
         if not candles:
             rows += (
                 f'<tr><td style="color:#88ccff;font-weight:bold">{TF_LABEL[tf]}</td>'
-                f'<td colspan="5" style="color:#334455">No data</td></tr>'
+                f'<td colspan="7" style="color:#334455">No data</td></tr>'
             )
             continue
         w   = analyze_wyckoff(candles)
@@ -289,13 +383,18 @@ def _multi_tf_table(data_by_tf, highlight_tfs=None):
         rl  = _f(w["range_low"])
         evs = " · ".join(w["events"][:3])
         hl  = "background:#0d1a2a;" if tf in hl_set else ""
+
+        rsi_str, rsi_col, vol_str, vol_col = _rsi_vol_cells(w, candles)
+
         rows += (
             f'<tr style="{hl}">'
             f'<td style="color:#88ccff;font-weight:bold;white-space:nowrap">{TF_LABEL[tf]}</td>'
             f'<td style="color:{sc}">{w["structure"]}</td>'
             f'<td style="color:#ffd700;white-space:nowrap">Phase {w["phase"]}</td>'
             f'<td style="color:#00e5ff;white-space:nowrap;font-size:12px">{_range_label(w["structure"], rh, rl)}</td>'
-            f'<td style="font-size:11px;color:#8899aa;max-width:300px">{evs}</td>'
+            f'<td style="font-size:11px;color:#8899aa;max-width:280px">{evs}</td>'
+            f'<td style="color:{rsi_col};white-space:nowrap;font-size:12px">{rsi_str}</td>'
+            f'<td style="color:{vol_col};white-space:nowrap;font-size:12px">{vol_str}</td>'
             f'<td style="color:{cc};white-space:nowrap;font-size:12px">{w["confidence"]}</td>'
             f'</tr>'
         )
@@ -307,6 +406,8 @@ def _multi_tf_table(data_by_tf, highlight_tfs=None):
         '<th style="color:#334455">Phase</th>'
         '<th style="color:#334455">SC/AR · BC/AR · Range</th>'
         '<th style="color:#334455">Key Events</th>'
+        '<th style="color:#334455">RSI(14)</th>'
+        '<th style="color:#334455">Vol/SMA</th>'
         '<th style="color:#334455">Conf</th>'
         f'</tr></thead><tbody style="color:#e6edf7">{rows}</tbody></table>'
     )
@@ -443,6 +544,18 @@ def generate_html(matches, scan_config, report_time, data_time, is_backtest):
                     f'</span>'
                 )
 
+        primary_candles = m["data_by_tf"].get(conditions[0]["tf"], [])
+        pts_panel  = _wyckoff_points_panel(w, primary_candles)
+        rsi_str, rsi_col, vol_str, vol_col = _rsi_vol_cells(w, primary_candles)
+        rsi_badge = (
+            f'<span style="background:#1e2d40;color:{rsi_col};padding:3px 9px;'
+            f'border-radius:4px;font-size:12px">RSI {rsi_str}</span>'
+        )
+        vol_badge = (
+            f'<span style="background:#1e2d40;color:{vol_col};padding:3px 9px;'
+            f'border-radius:4px;font-size:12px">Vol {vol_str}</span>'
+        )
+
         detail_cards += (
             f'<div id="{sym}" class="card">'
             f'<details open>'
@@ -454,6 +567,7 @@ def generate_html(matches, scan_config, report_time, data_time, is_backtest):
             f'<span style="background:#1e2d40;color:#ffd700;padding:3px 12px;'
             f'border-radius:4px;font-size:13px">Phase {w["phase"]}</span>'
             f'{"<span style=background:" + dir_col + "22;color:" + dir_col + ";padding:3px 10px;border-radius:4px;font-size:12px>" + dir_label + "</span>" if dir_label else ""}'
+            f'{rsi_badge}{vol_badge}'
             f'<span style="color:{cc};font-size:12px">{w["confidence"]}</span>'
             f'<span style="color:#334455;font-size:13px">▼</span>'
             f'</span>'
@@ -463,7 +577,8 @@ def generate_html(matches, scan_config, report_time, data_time, is_backtest):
             f'{cond_ranges if multi_mode else ""}'
             f'{"<span style=font-size:12px;color:#667788>" + TF_LABEL.get(primary_tf, primary_tf) + ": </span><span style=color:#00e5ff;font-size:13px>" + _range_label(w["structure"], _f(w["range_high"]), _f(w["range_low"])) + "</span>" if not multi_mode else ""}'
             f'</div>'
-            f'<div style="margin-bottom:14px">{ev_badges}</div>'
+            f'<div style="margin-bottom:8px">{ev_badges}</div>'
+            f'{pts_panel}'
             f'{multi_tf}'
             f'</div>'
             f'</details>'

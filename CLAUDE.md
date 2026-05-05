@@ -40,45 +40,49 @@ Shared module imported by **both** `analyze_instrument.py` and `wyckoff_phase_sc
 from wyckoff_core import analyze_wyckoff
 result = analyze_wyckoff(candles, verbose=False)
 # returns: structure, phase, events, confidence, range_high, range_low,
-#          full_trend, recent_trend, ranging
+#          full_trend, recent_trend, ranging, _points
 ```
 
 - `verbose=False` → short scanner labels (`"SOS"`, `"Spring"`, …)
 - `verbose=True` → descriptive labels (`"SOS — break above range high"`, …) — used by `analyze_instrument.py`
+- `_points` → raw detection dict with `acc`, `dist`, `context`, `rsi`, `vol_sma`, `range_high`, `range_low` — used by report renderers to show per-point RSI/Vol/time badges
+
+**Detection algorithm (v2 — pivot + RSI + volume):**
+
+Sequential detection: `SC → AR → ST → Spring → SOS → LPS` (accumulation) / `BC → AR → ST → UTAD → SOW → LPSY` (distribution).
+
+- **SC**: pivot low + RSI < 30 + volume ≥ 1.5× SMA(20) + bearish candle
+- **AR**: first pivot high after SC with RSI exiting bear zone
+- **ST**: first pivot low after AR with price ≥ SC low × 0.995 (no new climax)
+- **Spring**: pivot low after ST with low < range_low but close > range_low (false break)
+- **SOS**: pivot high after Spring/ST with close > AR high × 1.001 + RSI > 50
+- **LPS**: pivot low after SOS with low ≥ AR high × 0.985 + RSI ≥ 40
+- **BC/UTAD/SOW/LPSY**: mirror logic for distribution
+
+**Context selection (Błąd 1 fix):** when both `acc` (SC found) and `dist` (BC found) are detected simultaneously, the winner is chosen by **sequence score** (how many points confirmed), not by SC.idx vs BC.idx. Tiebreak: whichever direction's last detected point is later.
+
+**`struct_trend` (Błąd 2 fix):** trend used for Accumulation vs Reaccumulation (and Distribution vs Redistribution) classification is computed on candles **before SC/BC**, not on the full 60-bar window. This prevents a post-SOS rally from causing a true Accumulation to be mislabelled as Reaccumulation.
 
 **Tuning constants (all at module top — edit here, never inline):**
 
 | Constant | Value | Meaning |
 |---|---|---|
-| `RANGE_SPAN_MAX` | 0.20 | `(high−low)/avg` must be < this for a range window |
-| `RANGE_SLOPE_MAX` | 0.008 | `\|linreg slope\| / mean_price` per bar must be < this |
-| `RANGE_SPAN_GROW_MAX` | 1.5 | span growth >50% + above floor → natural boundary |
-| `RANGE_SPAN_FLOOR` | 0.05 | minimum span before growth heuristic activates |
-| `RANGE_BOUNDS_DRIFT` | 0.03 | bounds may not drift >3% of avg from initial-window bounds |
-| `SPRING_HEIGHT_RATIO` | 0.20 | spring/UTAD pierce ≥ 20% of range height |
-| `SPRING_PIERCE_MIN` | 0.002 | absolute pierce floor (0.2% of price) |
-| `SOS_SOW_BUFFER` | 0.002 | SOS: `close > rh × 1.002`; SOW: `close < rl × 0.998` |
-| `SC_BC_VOL_MULT` | 2.0 | SC/BC: peak volume ≥ 2× rolling mean |
-| `_RANGE_WIN_MIN/_MAX` | 10/40 | adaptive window search range |
-| `_TAIL_WIN` | 15 | tail window for SOS/SOW/Spring/UTAD detection |
+| `PIVOT_LEN` | 5 | bars on each side for pivot high/low detection |
+| `RSI_LEN` | 14 | RSI period |
+| `RSI_SENS` | 20 | neutral band: 50±20 (bull > 70, bear < 30) |
+| `SC_VOL_MULT` | 1.5 | SC/BC: volume ≥ 1.5× SMA(20) |
+| `ST_VOL_RATIO` | 0.80 | ST: volume ≤ 0.80× SMA(20) preferred |
+| `RANGE_SPAN_MAX` | 0.25 | `(high−low)/avg` < this for a range window |
+| `RANGE_SLOPE_MAX` | 0.010 | `\|slope\| / avg_price` per bar |
 | `_MIN_CANDLES` | 30 | minimum candles; fewer → returns `Insufficient` |
-
-**`_find_range_window` algorithm (v5):** grows from `_RANGE_WIN_MIN` → `_RANGE_WIN_MAX`, stopping at the **natural range boundary** via three complementary checks:
-1. Hard threshold: span ≥ `RANGE_SPAN_MAX` or slope ≥ `RANGE_SLOPE_MAX`
-2. Sharp transition: span jump > 50% of previous AND span > 5% floor (catches sudden entries into trend)
-3. Gradual contamination: cumulative bounds drift > 3% of avg from the smallest valid window (catches markdown/markup bleeding in candle-by-candle)
-
-**SC/BC window:** searched in `pre_tail[-_TAIL_WIN:]` (the 15 candles at the end of the consolidation), NOT in the breakout tail. This prevents the high-volume SOS/SOW candle from being mislabelled as BC/SC. Correct co-occurrence: `SC + SOS` is valid; `BC + SOS` is not.
-
-**Phase B:** fires on `ranging` (current 30-bar window is tight) only — not `has_range or ranging`. `has_range` without current tightness means the structure has broken out; falls through to Trend/Unclear.
 
 **Confidence:** graduated caps via `_CONF_CAPS` — `n < 45` → LOW, `n < 70` → MEDIUM, `n ≥ 70` → unrestricted.
 
 ### Legacy / other files
 - **`research/backtest.py`** — old backtest, now orphaned
 - **`fetch_and_zip_crypto.py`** + **`prompt_crypto_intradays_9_1.txt`** — Approach B: data fetch + LLM prompt workflow
-- **`analyze_instrument.py`** — single-instrument market structure report (no trade signals); imports `wyckoff_core.analyze_wyckoff` with `verbose=True`
-- **`wyckoff_phase_scanner.py`** — multi-timeframe Wyckoff phase scanner; imports `wyckoff_core.analyze_wyckoff` with `verbose=False`; timeframes: `5m / 15m / 30m / 1H / 4H / 1D / 1W`
+- **`analyze_instrument.py`** — single-instrument market structure report (no trade signals); imports `wyckoff_core.analyze_wyckoff` with `verbose=True`; Wyckoff section includes summary table (Structure / Phase / Range / Events / RSI(14) / Vol/SMA / Conf) and a separate Key Points table (per-TF × per-point with price, `dd/mm HH:MM` for SC/BC/AR, RSI, Vol/SMA)
+- **`wyckoff_phase_scanner.py`** — multi-timeframe Wyckoff phase scanner; imports `wyckoff_core.analyze_wyckoff` with `verbose=False`; timeframes: `5m / 15m / 30m / 1H / 4H / 1D / 1W`; multi-TF table includes RSI(14) and Vol/SMA columns; detail cards show RSI/Vol badges in header + Wyckoff points panel (`_wyckoff_points_panel`) with per-point price/RSI/Vol and `dd/mm HH:MM` candle time for SC, BC, AR
 - **`clean_output.py`** — removes files from `output/`, `strategy_wyckoff_9_5/output/`, `strategy_wyckoff_9_4/output/`, `results/`, `cache/` (`--dry-run`, `--cache` flags)
 
 ## Environment setup
@@ -460,6 +464,12 @@ Interactive: symbol (auto-appends `USDT`) · `t` (live) or `h` (`dd/mm/yyyy hh:m
 Output: `output/analysis_{SYMBOL}_{TIMESTAMP}.html`, auto-opens Chrome.
 
 Wyckoff analysis delegates to `wyckoff_core.analyze_wyckoff(candles, verbose=True)` — descriptive event labels. Do not modify the Wyckoff logic in this file; edit `wyckoff_core.py`.
+
+**Wyckoff HTML sections in `generate_report()`:**
+
+1. **Wyckoff Analysis** — summary table per TF: Structure · Phase · SC/AR or BC/AR range · Key Events · RSI(14) · Vol/SMA(20) · Confidence
+
+2. **Wyckoff Key Points** — per-TF × per-point table (columns: SC/BC · AR · ST · Spring/UTAD · SOS/SOW · LPS/LPSY). Each detected cell shows: price · `dd/mm HH:MM` UTC (SC/BC/AR only) · RSI · Vol/SMA · ↓v/↑v low/high-volume markers. Built from `w["_points"]["acc"|"dist"]`.
 
 **`analyze_liquidity()` — enhanced level detection:**
 - Lookback 150 candles; three swing windows lb=3/5/8 (minor/intermediate/major)

@@ -136,6 +136,89 @@ def get_candles_stock(symbol, interval, end_time_ms=None):
     return []
 
 # ============================================================
+# YFINANCE (złoto, forex, indeksy, akcje bez Polygon)
+# ============================================================
+
+_YF_INTERVAL = {
+    "5m":  "5m",
+    "15m": "15m",
+    "30m": "30m",
+    "1H":  "1h",
+    "4H":  "1h",   # pobieramy 1H i resample do 4H
+    "1D":  "1d",
+    "1W":  "1wk",
+}
+
+_YF_LOOKBACK_DAYS = {
+    "5m":  59,    # yfinance limit: ~60 dni dla intraday
+    "15m": 59,
+    "30m": 59,
+    "1H":  720,
+    "4H":  720,
+    "1D":  1800,
+    "1W":  3650,
+}
+
+def get_candles_yfinance(symbol, interval, end_time_ms=None):
+    try:
+        import yfinance as yf
+        import pandas as pd
+    except ImportError:
+        print("  Brak yfinance — zainstaluj: pip install yfinance")
+        return []
+
+    yf_interval = _YF_INTERVAL.get(interval, "1d")
+    days        = _YF_LOOKBACK_DAYS.get(interval, 200)
+    end_ts      = end_time_ms / 1000 if end_time_ms else time.time()
+    start_ts    = end_ts - days * 86400
+
+    from datetime import timezone as _tz
+    end_dt   = datetime.fromtimestamp(end_ts,   tz=_tz.utc)
+    start_dt = datetime.fromtimestamp(start_ts, tz=_tz.utc)
+
+    try:
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(
+            start=start_dt.strftime("%Y-%m-%d"),
+            end=(end_dt + __import__("datetime").timedelta(days=1)).strftime("%Y-%m-%d"),
+            interval=yf_interval,
+            auto_adjust=True,
+        )
+        if df is None or df.empty:
+            return []
+
+        # Resample 1H → 4H
+        if interval == "4H":
+            df = df.resample("4h", origin="start_day").agg({
+                "Open":   "first",
+                "High":   "max",
+                "Low":    "min",
+                "Close":  "last",
+                "Volume": "sum",
+            }).dropna(subset=["Open", "Close"])
+
+        candles = []
+        for ts, row in df.iterrows():
+            t = int(ts.timestamp()) if hasattr(ts, "timestamp") else int(ts.value // 1_000_000_000)
+            if end_time_ms and t > end_ts:
+                continue
+            candles.append({
+                "time":   t,
+                "open":   float(row["Open"]),
+                "high":   float(row["High"]),
+                "low":    float(row["Low"]),
+                "close":  float(row["Close"]),
+                "volume": float(row.get("Volume", 0) or 0),
+            })
+
+        return candles[-400:] if len(candles) > 400 else candles
+
+    except Exception as e:
+        print(f"  yfinance error ({symbol} {interval}): {e}")
+        return []
+
+
+# ============================================================
 # HELPERS
 # ============================================================
 
@@ -913,9 +996,10 @@ def generate_report(symbol, data_by_tf, report_time, data_time, is_backtest):
     for tf in TIMEFRAMES:
         a = A.get(tf)
         if not a:
-            wy_rows += f'<tr><td style="font-weight:bold">{TF_LABEL[tf]}</td><td colspan="4" style="color:#556677">No data</td></tr>'
+            wy_rows += f'<tr><td style="font-weight:bold">{TF_LABEL[tf]}</td><td colspan="7" style="color:#556677">No data</td></tr>'
             continue
-        w = a["wyckoff"]
+        w       = a["wyckoff"]
+        candles = a["candles"]
         cc = {"HIGH":"#00ff8c","MEDIUM":"#ffd700","LOW":"#888"}.get(w["confidence"],"#888")
         sc = ("#00ff8c" if any(k in w["structure"] for k in ("Accum","Bullish"))
               else "#ff4d4d" if any(k in w["structure"] for k in ("Distrib","Bearish"))
@@ -923,20 +1007,146 @@ def generate_report(symbol, data_by_tf, report_time, data_time, is_backtest):
         rh_str    = _f(w["range_high"]) if w["range_high"] else "N/A"
         rl_str    = _f(w["range_low"])  if w["range_low"]  else "N/A"
         range_str = _range_label(w["structure"], rh_str, rl_str)
+
+        # RSI
+        pts     = w.get("_points") or {}
+        rsi_arr = pts.get("rsi", [])
+        vsma    = pts.get("vol_sma", [])
+        last_rsi = next((r for r in reversed(rsi_arr) if r is not None), None)
+        if last_rsi is not None:
+            rsi_str = f"{last_rsi:.1f}"
+            rsi_col = "#00ff8c" if last_rsi > 70 else ("#ff4d4d" if last_rsi < 30 else "#ffd700")
+        else:
+            rsi_str, rsi_col = "N/A", "#8899aa"
+
+        # Vol / SMA(20)
+        last_vsma = next((v for v in reversed(vsma) if v is not None), None)
+        last_vol  = candles[-1]["volume"] if candles else None
+        if last_vol is not None and last_vsma and last_vsma > 0:
+            vr      = last_vol / last_vsma
+            vol_str = f"{vr:.2f}×"
+            vol_col = "#00ff8c" if vr >= 1.5 else ("#ffd700" if vr >= 0.8 else "#ff8844")
+        else:
+            vol_str, vol_col = "N/A", "#8899aa"
+
         wy_rows += (f'<tr><td style="font-weight:bold">{TF_LABEL[tf]}</td>'
                     f'<td style="color:{sc}">{w["structure"]}</td>'
                     f'<td>Phase {w["phase"]}</td>'
                     f'<td style="color:#00e5ff;font-size:12px;white-space:nowrap">{range_str}</td>'
                     f'<td style="font-size:12px;color:#aabbcc">{" | ".join(w["events"][:2])}</td>'
+                    f'<td style="color:{rsi_col};white-space:nowrap">{rsi_str}</td>'
+                    f'<td style="color:{vol_col};white-space:nowrap">{vol_str}</td>'
                     f'<td style="color:{cc}">{w["confidence"]}</td></tr>')
 
     wyckoff_html = (
         '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:13px">'
         '<thead style="background:#0d1520"><tr>'
         '<th style="padding:8px;color:#8899aa;text-align:left">TF</th>'
-        '<th>Structure</th><th>Phase</th><th style="white-space:nowrap">SC/AR · BC/AR · Range</th><th>Key Events</th><th>Confidence</th>'
+        '<th>Structure</th><th>Phase</th>'
+        '<th style="white-space:nowrap">SC/AR · BC/AR · Range</th>'
+        '<th>Key Events</th>'
+        '<th style="white-space:nowrap">RSI(14)</th>'
+        '<th style="white-space:nowrap">Vol/SMA</th>'
+        '<th>Confidence</th>'
         f'</tr></thead><tbody style="color:#e6edf7">{wy_rows}</tbody></table></div>'
     )
+
+    # ── Wyckoff Key Points ──
+    wy_pts_rows = ""
+    _TIME_KEYS = {"SC", "BC", "AR"}
+    for tf in TIMEFRAMES:
+        a = A.get(tf)
+        if not a:
+            continue
+        w          = a["wyckoff"]
+        candles_tf = a["candles"]
+        pts = w.get("_points") or {}
+        ctx = pts.get("context", "")
+        is_acc  = ctx == "accumulation"
+        is_dist = ctx == "distribution"
+        if not (is_acc or is_dist):
+            continue
+        events   = pts["acc"] if is_acc else pts["dist"]
+        pt_order = (["SC", "AR", "ST", "Spring", "SOS", "LPS"] if is_acc
+                    else ["BC", "AR", "ST", "UTAD", "SOW", "LPSY"])
+        vsma_arr = pts.get("vol_sma", [])
+        detected = [k for k in pt_order if k in events]
+        if not detected:
+            continue
+
+        ctx_col = "#00ff8c" if is_acc else "#ff4d4d"
+        ctx_lbl = "Accumulation" if is_acc else "Distribution"
+        pts_cells = ""
+        for key in pt_order:
+            pt = events.get(key)
+            cell_bg = "#0d1e14" if is_acc else "#1e0d0d"
+            if not pt:
+                pts_cells += f'<td style="color:#2a3a4a;font-size:11px;text-align:center">—</td>'
+                continue
+            idx     = pt.get("idx", 0)
+            price   = pt.get("price", 0)
+            rsi_v   = pt.get("rsi")
+            vol     = pt.get("volume", 0)
+            vsma_v  = vsma_arr[idx] if idx < len(vsma_arr) and vsma_arr[idx] is not None else None
+
+            rsi_str = f"{rsi_v:.1f}" if rsi_v is not None else "—"
+            rsi_c   = ("#00ff8c" if (rsi_v or 50) > 70
+                       else "#ff4d4d" if (rsi_v or 50) < 30 else "#ffd700")
+            if vsma_v and vsma_v > 0:
+                vr      = vol / vsma_v
+                vol_str = f"{vr:.1f}×"
+                vol_c   = "#00ff8c" if vr >= 1.5 else ("#ffd700" if vr >= 0.8 else "#ff8844")
+            else:
+                vol_str, vol_c = "—", "#8899aa"
+
+            lo_hi = ""
+            if pt.get("low_volume"):  lo_hi = '<span style="color:#ff8844;font-size:9px"> ↓v</span>'
+            if pt.get("high_volume"): lo_hi = '<span style="color:#00ff8c;font-size:9px"> ↑v</span>'
+
+            time_line = ""
+            if key in _TIME_KEYS and idx < len(candles_tf):
+                ts = candles_tf[idx].get("time")
+                if ts:
+                    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+                    time_line = f'<div style="color:#556677;font-size:10px">{dt.strftime("%d/%m %H:%M")}</div>'
+
+            pts_cells += (
+                f'<td style="background:{cell_bg};font-size:11px;padding:5px 6px;vertical-align:top">'
+                f'<div style="color:#e6edf7">{_f(price)}</div>'
+                f'{time_line}'
+                f'<div style="color:{rsi_c}">RSI {rsi_str}</div>'
+                f'<div style="color:{vol_c}">Vol {vol_str}{lo_hi}</div>'
+                f'</td>'
+            )
+
+        wy_pts_rows += (
+            f'<tr>'
+            f'<td style="font-weight:bold;white-space:nowrap">{TF_LABEL[tf]}</td>'
+            f'<td style="color:{ctx_col};font-size:11px">{ctx_lbl}</td>'
+            f'{pts_cells}'
+            f'</tr>'
+        )
+
+    pt_headers = "".join(
+        f'<th style="color:#334455;padding:6px;min-width:85px">{k}</th>'
+        for k in ["SC/BC", "AR", "ST", "Spring/UTAD", "SOS/SOW", "LPS/LPSY"]
+    )
+    wyckoff_pts_html = ""
+    if wy_pts_rows:
+        wyckoff_pts_html = (
+            '<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:12px">'
+            '<thead style="background:#0d1520"><tr>'
+            '<th style="padding:6px;color:#8899aa;text-align:left">TF</th>'
+            '<th style="color:#8899aa">Context</th>'
+            f'{pt_headers}'
+            f'</tr></thead><tbody style="color:#e6edf7">{wy_pts_rows}</tbody></table></div>'
+            '<div style="margin-top:6px;font-size:10px;color:#445566">'
+            '↓v = low volume (weak) · ↑v = high volume (strong) · '
+            'RSI colored: green &gt;70 · red &lt;30 · yellow neutral · '
+            'Vol = candle vol / SMA(20)</div>'
+        )
+    else:
+        wyckoff_pts_html = '<div style="color:#556677;font-size:12px">No sequential Wyckoff points detected.</div>'
 
     # ── Liquidity map — skonsolidowana multi-TF ──
     _TYPE_COLOR = {
@@ -1277,6 +1487,8 @@ def generate_report(symbol, data_by_tf, report_time, data_time, is_backtest):
 
 {_section("📊 Wyckoff Analysis", wyckoff_html)}
 
+{_section("📍 Wyckoff Key Points — RSI + Volume", wyckoff_pts_html)}
+
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;padding:20px 32px 0">
   <div>
     <h2 style="color:#e6edf7;border-bottom:1px solid #1e2d40;padding-bottom:8px;margin-bottom:16px">💧 Liquidity Map</h2>
@@ -1356,17 +1568,32 @@ def main():
 
     # ── Market selection ──
     print("\nRynek:")
-    print("  c = Krypto (Bybit)")
-    print("  s = Stock  (Polygon)")
-    market = input("Wybierz (c/s): ").strip().lower()
-    is_stock = (market == "s")
+    print("  c = Krypto  (Bybit)")
+    print("  s = Akcje   (Polygon)")
+    print("  y = Inne    (yfinance — złoto, forex, indeksy, akcje US)")
+    market = input("Wybierz (c/s/y): ").strip().lower()
 
-    if is_stock:
+    if market == "s":
         symbol = input("\nPodaj ticker (np. AAPL): ").strip().upper()
         if not symbol:
             print("Brak symbolu. Koniec.")
             return
         fetch_fn = get_candles_stock
+    elif market == "y":
+        print("\nPrzykłady symboli yfinance:")
+        print("  Złoto (futures):  GC=F")
+        print("  Srebro (futures): SI=F")
+        print("  EUR/USD:          EURUSD=X")
+        print("  GBP/USD:          GBPUSD=X")
+        print("  USD/JPY:          USDJPY=X")
+        print("  S&P 500:          ^GSPC")
+        print("  NASDAQ:           ^IXIC")
+        print("  Akcje US:         AAPL, MSFT, NVDA ...")
+        symbol = input("\nPodaj ticker: ").strip().upper()
+        if not symbol:
+            print("Brak symbolu. Koniec.")
+            return
+        fetch_fn = get_candles_yfinance
     else:
         symbol = input("\nPodaj symbol (np. BTC lub BTCUSDT): ").strip().upper()
         if not symbol:
@@ -1405,7 +1632,7 @@ def main():
         print(f"{len(candles)} świec")
 
     if not any(data_by_tf.values()):
-        src = "Polygon" if is_stock else "Bybit Linear"
+        src = {"s": "Polygon", "y": "yfinance"}.get(market, "Bybit Linear")
         print(f"\nBrak danych dla {symbol}. Sprawdź czy ticker istnieje w {src}.")
         return
 

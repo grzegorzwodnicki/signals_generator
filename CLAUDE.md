@@ -81,15 +81,15 @@ Sequential detection: `SC → AR → ST → Spring → SOS → LPS` (accumulatio
 ### Legacy / other files
 - **`research/backtest.py`** — old backtest, now orphaned
 - **`fetch_and_zip_crypto.py`** + **`prompt_crypto_intradays_9_1.txt`** — Approach B: data fetch + LLM prompt workflow
-- **`analyze_instrument.py`** — single-instrument market structure report (no trade signals); imports `wyckoff_core.analyze_wyckoff` with `verbose=True`; Wyckoff section includes summary table (Structure / Phase / Range / Events / RSI(14) / Vol/SMA / Conf) and a separate Key Points table (per-TF × per-point with price, `dd/mm HH:MM` for SC/BC/AR, RSI, Vol/SMA)
-- **`wyckoff_phase_scanner.py`** — multi-timeframe Wyckoff phase scanner; imports `wyckoff_core.analyze_wyckoff` with `verbose=False`; timeframes: `5m / 15m / 30m / 1H / 4H / 1D / 1W`; multi-TF table includes RSI(14) and Vol/SMA columns; detail cards show RSI/Vol badges in header + Wyckoff points panel (`_wyckoff_points_panel`) with per-point price/RSI/Vol and `dd/mm HH:MM` candle time for SC, BC, AR
+- **`analyze_instrument.py`** — single-instrument market structure report (no trade signals); imports `wyckoff_core.analyze_wyckoff` with `verbose=True`; Wyckoff section includes summary table (Structure / Phase / Range / Events / RSI(14) / Vol/SMA / Conf) and a separate Key Points table (per-TF × per-point with price, `dd/mm HH:MM` for SC/BC/AR, RSI, Vol/SMA); supports three data sources: Bybit (krypto), Polygon (akcje), **yfinance** (złoto, forex, indeksy, akcje US — wybór `y` w menu)
+- **`wyckoff_phase_scanner.py`** — multi-timeframe Wyckoff phase scanner; imports `wyckoff_core.analyze_wyckoff` with `verbose=False`; timeframes: `5m / 15m / 30m / 1H / 4H / 1D / 1W`; multi-TF table includes RSI(14) and Vol/SMA columns; detail cards show RSI/Vol badges in header + Wyckoff points panel (`_wyckoff_points_panel`) with per-point price/RSI/Vol and `dd/mm HH:MM` candle time for SC, BC, AR; supports up to 6 conditions (each with its own TF + phases); **same-direction enforcement**: instruments where any condition's TF has a different Wyckoff direction than another are rejected — `Accumulation == Reaccumulation` (both bullish), `Distribution == Redistribution` (both bearish); e.g. `4H Ph B,C` + `1H Ph B,C` returns only instruments where both TFs agree on direction
 - **`clean_output.py`** — removes files from `output/`, `strategy_wyckoff_9_5/output/`, `strategy_wyckoff_9_4/output/`, `results/`, `cache/` (`--dry-run`, `--cache` flags)
 
 ## Environment setup
 
 ```bash
 source venv/bin/activate
-pip install requests   # only dependency
+pip install requests yfinance   # yfinance required for analyze_instrument.py (złoto/forex/indeksy)
 ```
 
 ## Running the scanner
@@ -460,8 +460,22 @@ source venv/bin/activate
 python analyze_instrument.py
 ```
 
-Interactive: symbol (auto-appends `USDT`) · `t` (live) or `h` (`dd/mm/yyyy hh:mm`).
+Interactive: rynek (`c` / `s` / `y`) · symbol · `t` (live) or `h` (`dd/mm/yyyy hh:mm`).
 Output: `output/analysis_{SYMBOL}_{TIMESTAMP}.html`, auto-opens Chrome.
+
+**Data sources (menu `c/s/y`):**
+
+| Opcja | Źródło | Przykładowe symbole |
+|---|---|---|
+| `c` | Bybit (krypto) | `BTC`, `ETHUSDT` |
+| `s` | Polygon (akcje US) | `AAPL`, `NVDA` |
+| `y` | yfinance (złoto, forex, indeksy, akcje) | `GC=F`, `EURUSD=X`, `GBPUSD=X`, `USDJPY=X`, `^GSPC`, `^IXIC` |
+
+**`get_candles_yfinance(symbol, interval, end_time_ms=None)`:**
+- 4H nie istnieje w yfinance — pobierane jako 1H i resample `pandas.resample("4h")`
+- Limity lookback: 5M/15M/30M → 59 dni; 1H/4H → 720 dni; 1D → 1800 dni; 1W → 3650 dni
+- Dla forex/złota freshness check może pokazać `STALE` w weekendy (rynki zamknięte) — to normalne
+- yfinance importowany wewnątrz funkcji (soft dependency); bez niego reszta skryptu działa
 
 Wyckoff analysis delegates to `wyckoff_core.analyze_wyckoff(candles, verbose=True)` — descriptive event labels. Do not modify the Wyckoff logic in this file; edit `wyckoff_core.py`.
 

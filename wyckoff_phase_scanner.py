@@ -187,17 +187,29 @@ WYCKOFF_STRUCTS  = {"Accumulation", "Reaccumulation", "Distribution", "Redistrib
 _BULLISH_STRUCTS = {"Accumulation", "Reaccumulation"}
 _BEARISH_STRUCTS = {"Distribution", "Redistribution"}
 
-def _matches(wy, selected_phases):
-    """Return True if Wyckoff result matches any of the selected phases (OR logic)."""
+def _matches(wy, selected_phases, direction=None):
+    """Return True if Wyckoff result matches any of the selected phases (OR logic).
+
+    direction: 'long'  = only bullish structures (Accumulation + Reaccumulation)
+               'short' = only bearish structures (Distribution + Redistribution)
+               None    = any direction
+    """
     p      = wy.get("phase", "Unclear")
     struct = wy.get("structure", "UNCLEAR")
     evs    = " ".join(wy.get("events", []))
 
     for selected_phase in selected_phases:
         if selected_phase == "A":
-            if "SC" in evs or "BC" in evs:
+            # SC = accumulation (long), BC = distribution (short)
+            if "SC" in evs and direction != "short":
+                return True
+            if "BC" in evs and direction != "long":
                 return True
         elif struct in WYCKOFF_STRUCTS and p == selected_phase:
+            if direction == "long" and struct not in _BULLISH_STRUCTS:
+                continue
+            if direction == "short" and struct not in _BEARISH_STRUCTS:
+                continue
             return True
     return False
 
@@ -207,18 +219,20 @@ def _check_conditions(data_by_tf, conditions):
     Check all conditions against fetched candles.
     Returns (matched, direction, wyckoff_by_tf) or (False, None, {}).
     Direction must be consistent across all conditions.
+    Acc == ReAcc (both bullish); Dist == ReDist (both bearish).
     """
     directions    = set()
     wyckoff_by_tf = {}
 
     for cond in conditions:
-        tf      = cond["tf"]
-        phases  = cond["phases"]
-        candles = data_by_tf.get(tf, [])
+        tf        = cond["tf"]
+        phases    = cond["phases"]
+        direction = cond.get("direction")   # 'long' / 'short' / None
+        candles   = data_by_tf.get(tf, [])
         if len(candles) < 20:
             return False, None, {}
         wy = analyze_wyckoff(candles)
-        if not _matches(wy, phases):
+        if not _matches(wy, phases, direction):
             return False, None, {}
         wyckoff_by_tf[tf] = wy
 
@@ -724,7 +738,8 @@ def main():
         print(f"\nWarunki: " + "  +  ".join(
             f'{TF_LABEL.get(c["tf"], c["tf"])} Ph{"/".join(c["phases"])}' for c in conditions
         ))
-        print("Skaner znajdzie instrumenty pasujące do WSZYSTKICH warunków w tym samym kierunku.")
+        print("Skaner znajdzie instrumenty pasujące do WSZYSTKICH warunków w tym samym kierunku."
+              " (Accumulation == Reaccumulation, Distribution == Redistribution)")
 
     # ── Time mode ──
     choice      = input("\nDane (t=teraz / h=historyczne): ").strip().lower()

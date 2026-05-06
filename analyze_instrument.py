@@ -1053,7 +1053,6 @@ def generate_report(symbol, data_by_tf, report_time, data_time, is_backtest):
 
     # ── Wyckoff Key Points ──
     wy_pts_rows = ""
-    _TIME_KEYS = {"SC", "BC", "AR"}
     for tf in TIMEFRAMES:
         a = A.get(tf)
         if not a:
@@ -1104,7 +1103,7 @@ def generate_report(symbol, data_by_tf, report_time, data_time, is_backtest):
             if pt.get("high_volume"): lo_hi = '<span style="color:#00ff8c;font-size:9px"> ↑v</span>'
 
             time_line = ""
-            if key in _TIME_KEYS and idx < len(candles_tf):
+            if idx < len(candles_tf):
                 ts = candles_tf[idx].get("time")
                 if ts:
                     dt = datetime.fromtimestamp(ts, tz=timezone.utc)

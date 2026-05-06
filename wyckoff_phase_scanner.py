@@ -324,7 +324,6 @@ def _wyckoff_points_panel(w, candles=None):
     pt_order = (["SC", "AR", "ST", "Spring", "SOS", "LPS"] if is_acc
                 else ["BC", "AR", "ST", "UTAD", "SOW", "LPSY"])
     vsma     = pts.get("vol_sma", [])
-    _TIME_KEYS = {"SC", "BC", "AR"}
 
     items = ""
     for key in pt_order:
@@ -353,7 +352,7 @@ def _wyckoff_points_panel(w, candles=None):
         if pt.get("high_volume"): marker = " ↑v"
 
         time_badge = ""
-        if key in _TIME_KEYS and candles and idx < len(candles):
+        if candles and idx < len(candles):
             ts = candles[idx].get("time")
             if ts:
                 dt = datetime.fromtimestamp(ts, tz=timezone.utc)

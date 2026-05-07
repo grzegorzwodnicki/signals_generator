@@ -34,6 +34,19 @@ _CONF_CAPS = [(70, "HIGH"), (45, "MEDIUM"), (0, "LOW")]
 # Minimalna liczba świec
 _MIN_CANDLES = 30
 
+# Walidacja wzorca — czy Wyckoff jest nadal aktualny?
+# Sprawdzane względem range_height = AR_high − SC_low (lub BC_high − AR_low).
+#
+# VALIDITY_PHASE_E_MULT: cena > AR + N×range_height → wzorzec zakończony,
+#   cena jest już w fazie E (markup/markdown).  Domyślnie 2.0 — tzn. cena
+#   musi być 2 zakresy powyżej AR żeby uznać że akumulacja już "grała".
+#
+# VALIDITY_INVALIDATE_MULT: cena < SC − N×range_height → wzorzec unieważniony
+#   (akumulacja nie trzyma, nowe dołki; analogicznie dla dystrybucji).
+#   Domyślnie 0.5 — tzn. cena 50% zakresu poniżej SC = wyraźny breakdown.
+VALIDITY_PHASE_E_MULT    = 2.0
+VALIDITY_INVALIDATE_MULT = 0.5
+
 # ── RSI ───────────────────────────────────────────────────────────────────────
 
 def _rsi(closes, period=14):
@@ -486,6 +499,42 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS):
                                         "low_volume": low_vol}
                         break
 
+    # ── Walidacja wzorca — czy pattern jest jeszcze aktualny? ───────────────────
+    # Sprawdza aktualną cenę względem wykrytego range'u.
+    # Dwa powody do unieważnienia:
+    #   1) Phase E — cena odeszła daleko poza range (wzorzec już "zagrał")
+    #   2) Invalidated — cena przebiła SC/BC w złym kierunku (wzorzec nie trzymał)
+    _validity_note = ""
+    current_price = candles[-1]["close"]
+
+    if acc and "SC" in acc and "AR" in acc:
+        sc_price = acc["SC"]["price"]
+        ar_price = acc["AR"]["price"]
+        rng = ar_price - sc_price
+        if rng > 0:
+            if current_price > ar_price + VALIDITY_PHASE_E_MULT * rng:
+                # Cena jest już N zakresów powyżej AR — akumulacja zakończona, Phase E
+                _validity_note = "acc_phase_e"
+                acc = {}
+            elif current_price < sc_price - VALIDITY_INVALIDATE_MULT * rng:
+                # Cena przebiła SC low — akumulacja upadła
+                _validity_note = "acc_invalidated"
+                acc = {}
+
+    if dist and "BC" in dist and "AR" in dist:
+        bc_price = dist["BC"]["price"]
+        ar_price = dist["AR"]["price"]
+        rng = bc_price - ar_price
+        if rng > 0:
+            if current_price < ar_price - VALIDITY_PHASE_E_MULT * rng:
+                # Cena jest N zakresów poniżej AR — dystrybucja zakończona, Phase E
+                _validity_note = _validity_note or "dist_phase_e"
+                dist = {}
+            elif current_price > bc_price + VALIDITY_INVALIDATE_MULT * rng:
+                # Cena przebiła BC high — dystrybucja upadła
+                _validity_note = _validity_note or "dist_invalidated"
+                dist = {}
+
     # ── Kontekst struktury ────────────────────────────────────────────────────
     has_acc  = "SC" in acc
     has_dist = "BC" in dist
@@ -513,13 +562,14 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS):
         context = "side" if context_zone == "side" else "unclear"
 
     return {
-        "acc":        acc,
-        "dist":       dist,
-        "context":    context,
-        "range_high": rh,
-        "range_low":  rl,
-        "rsi":        rsi_arr,
-        "vol_sma":    vsma,
+        "acc":           acc,
+        "dist":          dist,
+        "context":       context,
+        "range_high":    rh,
+        "range_low":     rl,
+        "rsi":           rsi_arr,
+        "vol_sma":       vsma,
+        "validity_note": _validity_note,  # "" = valid; "acc_phase_e" / "acc_invalidated" / dist_*
     }
 
 
@@ -592,6 +642,13 @@ def analyze_wyckoff(candles, verbose=False):
         struct_trend = full_trend
 
     # ── Zdarzenia ─────────────────────────────────────────────────────────────
+    _validity_note = pts.get("validity_note", "")
+    _VALIDITY_LABELS = {
+        "acc_phase_e":    "⚡ Phase E — above range" if not verbose else "Pattern invalidated: Phase E — price far above range (markup complete)",
+        "acc_invalidated":"⚡ Invalidated — below SC" if not verbose else "Pattern invalidated: price broke below SC low (accumulation failed)",
+        "dist_phase_e":   "⚡ Phase E — below range" if not verbose else "Pattern invalidated: Phase E — price far below range (markdown complete)",
+        "dist_invalidated":"⚡ Invalidated — above BC" if not verbose else "Pattern invalidated: price broke above BC high (distribution failed)",
+    }
     events = []
     if ctx == "accumulation":
         if "SC"     in acc: events.append(lbl["sc"])
@@ -603,6 +660,8 @@ def analyze_wyckoff(candles, verbose=False):
         if "UTAD" in dist: events.append(lbl["utad"])
         if "SOW"  in dist: events.append(lbl["sow"])
         if "LPSY" in dist: events.append(lbl["lpsy"])
+    if _validity_note in _VALIDITY_LABELS:
+        events.insert(0, _VALIDITY_LABELS[_validity_note])
     if not events:
         events.append(lbl["none"])
 

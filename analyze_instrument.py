@@ -24,6 +24,7 @@ BACKTEST_TIME_MS = None
 TIMEFRAMES   = ["5m", "15m", "30m", "1H", "4H", "1D", "1W"]
 TF_LABEL     = {"5m": "5M", "15m": "15M", "30m": "30M", "1H": "1H", "4H": "4H", "1D": "1D", "1W": "1W"}
 TF_BYBIT     = {"5m": "5",  "15m": "15",  "30m": "30",  "1H": "60", "4H": "240", "1D": "D", "1W": "W"}
+TF_BINANCE   = {"5m": "5m", "15m": "15m", "30m": "30m", "1H": "1h", "4H": "4h", "1D": "1d", "1W": "1w"}
 
 # ============================================================
 # DATA FETCHING
@@ -67,6 +68,56 @@ def get_candles(symbol, interval, end_time_ms=None):
     oldest_ts = min(int(c[0]) for c in b1)
     b2 = _bybit_candles_raw(symbol, interval, 200, oldest_ts - 1)
     return _parse(b1 + b2)
+
+# ============================================================
+# BINANCE (CRYPTO — no API key required)
+# ============================================================
+
+def _binance_candles_raw(symbol, interval, limit=200, end_time=None):
+    params = {
+        "symbol":   symbol,
+        "interval": TF_BINANCE.get(interval, interval),
+        "limit":    limit,
+    }
+    if end_time:
+        params["endTime"] = end_time
+    for attempt in range(4):
+        try:
+            r = requests.get(
+                "https://fapi.binance.com/fapi/v1/klines",
+                params=params, timeout=15,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                return data if isinstance(data, list) else []
+            if r.status_code == 429:
+                time.sleep(2 ** (attempt + 2))
+                continue
+            return []
+        except Exception:
+            if attempt < 3:
+                time.sleep(2 ** attempt)
+    return []
+
+def _parse_binance(raw):
+    seen, out = set(), []
+    for c in raw:
+        t = int(c[0])
+        if t not in seen:
+            seen.add(t)
+            out.append({"time": t // 1000, "open": float(c[1]), "high": float(c[2]),
+                        "low": float(c[3]), "close": float(c[4]), "volume": float(c[5])})
+    out.sort(key=lambda x: x["time"])
+    return out
+
+def get_candles_binance(symbol, interval, end_time_ms=None):
+    b1 = _binance_candles_raw(symbol, interval, 200, end_time_ms)
+    if not b1:
+        return []
+    time.sleep(0.1)
+    oldest_ts = min(int(c[0]) for c in b1)
+    b2 = _binance_candles_raw(symbol, interval, 200, oldest_ts - 1)
+    return _parse_binance(b2 + b1)
 
 # ============================================================
 # POLYGON (STOCKS)
@@ -1568,9 +1619,10 @@ def main():
     # ── Market selection ──
     print("\nRynek:")
     print("  c = Krypto  (Bybit)")
+    print("  b = Krypto  (Binance)")
     print("  s = Akcje   (Polygon)")
     print("  y = Inne    (yfinance — złoto, forex, indeksy, akcje US)")
-    market = input("Wybierz (c/s/y): ").strip().lower()
+    market = input("Wybierz (c/b/s/y): ").strip().lower()
 
     if market == "s":
         symbol = input("\nPodaj ticker (np. AAPL): ").strip().upper()
@@ -1593,7 +1645,17 @@ def main():
             print("Brak symbolu. Koniec.")
             return
         fetch_fn = get_candles_yfinance
+    elif market == "b":
+        symbol = input("\nPodaj symbol (np. BTC lub BTCUSDT): ").strip().upper()
+        if not symbol:
+            print("Brak symbolu. Koniec.")
+            return
+        if not symbol.endswith("USDT"):
+            symbol += "USDT"
+            print(f"  → {symbol}")
+        fetch_fn = get_candles_binance
     else:
+        market = "c"
         symbol = input("\nPodaj symbol (np. BTC lub BTCUSDT): ").strip().upper()
         if not symbol:
             print("Brak symbolu. Koniec.")
@@ -1631,7 +1693,7 @@ def main():
         print(f"{len(candles)} świec")
 
     if not any(data_by_tf.values()):
-        src = {"s": "Polygon", "y": "yfinance"}.get(market, "Bybit Linear")
+        src = {"s": "Polygon", "y": "yfinance", "b": "Binance Futures"}.get(market, "Bybit Linear")
         print(f"\nBrak danych dla {symbol}. Sprawdź czy ticker istnieje w {src}.")
         return
 

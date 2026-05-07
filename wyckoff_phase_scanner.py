@@ -25,9 +25,11 @@ BACKTEST_TIME_MS = None
 TIMEFRAMES = ["5m", "15m", "30m", "1H", "4H", "1D", "1W"]
 TF_LABEL   = {"5m": "5M", "15m": "15M", "30m": "30M", "1H": "1H", "4H": "4H", "1D": "1D", "1W": "1W"}
 TF_BYBIT   = {"5m": "5",  "15m": "15",  "30m": "30",  "1H": "60", "4H": "240", "1D": "D", "1W": "W"}
+TF_BINANCE = {"5m": "5m", "15m": "15m", "30m": "30m", "1H": "1h", "4H": "4h", "1D": "1d", "1W": "1w"}
 
 _SEMAPHORE         = threading.Semaphore(20)
 _POLYGON_SEMAPHORE = threading.Semaphore(5)
+_BINANCE_SEMAPHORE = threading.Semaphore(8)
 
 
 def _read_polygon_key():
@@ -96,6 +98,74 @@ def get_top_symbols(n=400):
     usdt = [t for t in tickers if t["symbol"].endswith("USDT")]
     usdt.sort(key=lambda t: float(t.get("turnover24h", 0)), reverse=True)
     return [t["symbol"] for t in usdt[:n]]
+
+# ============================================================
+# BINANCE (CRYPTO — no API key required)
+# ============================================================
+
+def _binance_candles_raw(symbol, interval, limit=200, end_time=None):
+    params = {
+        "symbol":   symbol,
+        "interval": TF_BINANCE.get(interval, interval),
+        "limit":    limit,
+    }
+    if end_time:
+        params["endTime"] = end_time
+    for attempt in range(4):
+        try:
+            r = requests.get(
+                "https://fapi.binance.com/fapi/v1/klines",
+                params=params, timeout=15,
+            )
+            if r.status_code == 200:
+                data = r.json()
+                return data if isinstance(data, list) else []
+            if r.status_code == 429:
+                time.sleep(2 ** (attempt + 2))
+                continue
+            return []
+        except Exception:
+            if attempt < 3:
+                time.sleep(2 ** attempt)
+    return []
+
+def _parse_binance(raw):
+    seen, out = set(), []
+    for c in raw:
+        t = int(c[0])
+        if t not in seen:
+            seen.add(t)
+            out.append({"time": t // 1000, "open": float(c[1]), "high": float(c[2]),
+                        "low": float(c[3]), "close": float(c[4]), "volume": float(c[5])})
+    out.sort(key=lambda x: x["time"])
+    return out
+
+def get_candles_binance(symbol, interval, end_time_ms=None):
+    with _BINANCE_SEMAPHORE:
+        b1 = _binance_candles_raw(symbol, interval, 200, end_time_ms)
+        if not b1:
+            return []
+        time.sleep(0.08)
+        oldest_ts = min(int(c[0]) for c in b1)
+        b2 = _binance_candles_raw(symbol, interval, 200, oldest_ts - 1)
+        return _parse_binance(b2 + b1)
+
+def get_top_symbols_binance(n=400):
+    try:
+        r = requests.get(
+            "https://fapi.binance.com/fapi/v1/ticker/24hr",
+            timeout=15,
+        )
+        if r.status_code != 200:
+            return []
+        tickers = r.json()
+        if not isinstance(tickers, list):
+            return []
+        usdt = [t for t in tickers if t.get("symbol", "").endswith("USDT")]
+        usdt.sort(key=lambda t: float(t.get("quoteVolume", 0)), reverse=True)
+        return [t["symbol"] for t in usdt[:n]]
+    except Exception:
+        return []
 
 # ============================================================
 # POLYGON (STOCKS)
@@ -698,8 +768,9 @@ def main():
     # ── Market selection ──
     print("\nRynek:")
     print("  c = Krypto (Bybit Top 400)")
+    print("  b = Krypto (Binance Top 400)")
     print("  s = Stocki (lista z pliku)")
-    market = input("Wybierz (c/s): ").strip().lower()
+    market = input("Wybierz (c/b/s): ").strip().lower()
 
     if market == "s":
         print("\nPlik symboli:")
@@ -711,6 +782,10 @@ def main():
         stock_file     = os.path.join(_root, stock_filename)
         fetch_fn       = get_candles_stock
         max_scan_workers = 5
+    elif market == "b":
+        stock_file       = None
+        fetch_fn         = get_candles_binance
+        max_scan_workers = 8
     else:
         market           = "c"
         stock_file       = None
@@ -768,11 +843,18 @@ def main():
             print("Brak symboli w pliku. Sprawdź ścieżkę.")
             return
         print(f"  {len(symbols)} symboli.")
+    elif market == "b":
+        print("\nPobieram Top 400 symboli z Binance...")
+        symbols = get_top_symbols_binance(400)
+        if not symbols:
+            print("Nie udało się pobrać listy symboli Binance. Sprawdź połączenie.")
+            return
+        print(f"  {len(symbols)} symboli.")
     else:
-        print("\nPobieram Top 400 symboli...")
+        print("\nPobieram Top 400 symboli z Bybit...")
         symbols = get_top_symbols(400)
         if not symbols:
-            print("Nie udało się pobrać listy symboli. Sprawdź połączenie.")
+            print("Nie udało się pobrać listy symboli Bybit. Sprawdź połączenie.")
             return
         print(f"  {len(symbols)} symboli.")
 
@@ -849,7 +931,12 @@ def main():
     html = generate_html(candidates, scan_config, report_time, data_time, is_backtest)
 
     cond_safe    = "_".join(f'{c["tf"]}ph{"".join(c["phases"])}' for c in conditions)
-    market_label = "stocks_" + os.path.splitext(stock_filename)[0] if market == "s" else "crypto"
+    if market == "s":
+        market_label = "stocks_" + os.path.splitext(stock_filename)[0]
+    elif market == "b":
+        market_label = "crypto_binance"
+    else:
+        market_label = "crypto_bybit"
     ts_str       = datetime.now().strftime("%Y_%m_%d_%H%M")
     if is_backtest and BACKTEST_TIME_MS:
         bt_ts   = datetime.fromtimestamp(BACKTEST_TIME_MS / 1000).strftime("%Y_%m_%d_%H%M")

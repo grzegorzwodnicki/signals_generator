@@ -408,7 +408,8 @@ def _rsi_zone(rsi_val, sens=RSI_SENS):
 # GŁÓWNA FUNKCJA — DETEKCJA PUNKTÓW WYCKOFFA
 # ══════════════════════════════════════════════════════════════════════════════
 
-def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require_rsi_climax=True):
+def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS,
+                        require_rsi_climax=True, no_rsi=False):
     """
     Wykrywa sekwencyjnie punkty Wyckoffa na liście świec.
 
@@ -419,6 +420,9 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
       True  — strict: RSI<30 dla SC / RSI>70 dla BC, volume >= 1.5x SMA (klasyczny klimaks)
       False — soft:   brak RSI gate dla SC (RSI>=60 dla BC), volume >= 1.0x SMA
               Wykrywa również SC/BC wyczerpaniowe (Exhaustion Climax wg. Villahermosa Ch.15)
+
+    no_rsi=True — usuwa WSZYSTKIE bramki RSI (SC/BC/AR/ST/SOS/LPS/SOW/LPSY).
+      Detekcja oparta wyłącznie na pivotach cenowych i wolumenie.
 
     Parametry:
       candles   – lista dict {open, high, low, close, volume, time}
@@ -450,6 +454,26 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
     rsi_low  = 50 - rsi_sens   # np. 30
     rsi_high = 50 + rsi_sens   # np. 70
 
+    # Progi RSI dla poszczególnych punktów (zastępowane gdy no_rsi=True)
+    if no_rsi:
+        # Zastąp None wartościami neutralnymi — żadna bramka RSI nie odfiltruje
+        rsi_arr = [50.0 if r is None else r for r in rsi_arr]
+        rsi_low  = -1    # r < -1 → nigdy True
+        rsi_high = 101   # r > 101 → nigdy True
+        _sc_rsi_max   = 101  # r >= 101 → nigdy True (SC nie odfiltrowane)
+        _bc_rsi_min   = -1   # r < -1 → nigdy True
+        _sos_rsi_min  = -1   # r > -1 → zawsze True
+        _lps_rsi_min  = -1   # r >= -1 → zawsze True
+        _sow_rsi_max  = 101  # r < 101 → zawsze True
+        _lpsy_rsi_max = 101  # r <= 101 → zawsze True
+    else:
+        _sc_rsi_max   = SC_SOFT_RSI_MAX   # 50
+        _bc_rsi_min   = BC_SOFT_RSI_MIN   # 60
+        _sos_rsi_min  = 55
+        _lps_rsi_min  = 40
+        _sow_rsi_max  = 45
+        _lpsy_rsi_max = 55
+
     # ── Kontekst RSI (ostatnia wartość) ──────────────────────────────────────
     last_rsi = next((r for r in reversed(rsi_arr) if r is not None), 50.0)
     context_zone = _rsi_zone(last_rsi, rsi_sens)
@@ -480,7 +504,7 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
             if r >= rsi_low:        # strict: RSI >= 30 → odrzuć
                 continue
         else:
-            if r >= SC_SOFT_RSI_MAX:  # soft: RSI >= 50 → odrzuć (nie SC, a normalny pullback)
+            if r >= _sc_rsi_max:    # soft: RSI >= 50 → odrzuć (lub 101 gdy no_rsi=True)
                 continue
         # Wolumen >= threshold * sma(vol,20)
         if candles[i]["volume"] < v * _sc_vol_thresh:
@@ -645,7 +669,7 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
                         continue
                     c = candles[i]
                     above_cr = c["close"] > cr_high * 1.01
-                    bull_rsi  = r > 55  # RSI przekracza środek (stricter)
+                    bull_rsi  = r > _sos_rsi_min  # RSI > 55 (lub -1 gdy no_rsi=True)
                     hi_vol    = v is None or c["volume"] >= v * 1.0
                     if above_cr and bull_rsi:
                         acc["SOS"] = {"idx": i, "price": c["high"],
@@ -669,7 +693,7 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
                         continue
                     c = candles[i]
                     above_support = c["low"] >= cr_high * 0.985  # blisko starego resistance
-                    rsi_ok = r >= 40  # RSI nie wraca w oversold
+                    rsi_ok = r >= _lps_rsi_min  # RSI >= 40 (lub -1 gdy no_rsi=True)
                     low_vol = v is None or c["volume"] <= v * ST_VOL_RATIO
                     if above_support and rsi_ok:
                         acc["LPS"] = {"idx": i, "price": c["low"],
@@ -722,7 +746,7 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
             if r <= rsi_high:
                 continue
         else:
-            if r < BC_SOFT_RSI_MIN:  # wyklucza oczywiste nie-kulminacje (RSI < 60)
+            if r < _bc_rsi_min:  # wyklucza nie-kulminacje (RSI < 60 lub -1 gdy no_rsi=True)
                 continue
         if candles[i]["volume"] < v * _bc_vol_thresh:
             continue
@@ -850,7 +874,7 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
                         continue
                     c = candles[i]
                     below_cr = c["close"] < cr_low_d * SOW_MIN_BELOW_AR
-                    bear_rsi  = r < 45
+                    bear_rsi  = r < _sow_rsi_max  # RSI < 45 (lub 101 gdy no_rsi=True)
                     if below_cr and bear_rsi:
                         dist["SOW"] = {"idx": i, "price": c["low"],
                                        "close": c["close"],
@@ -871,7 +895,7 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
                         continue
                     c = candles[i]
                     below_resistance = c["high"] <= cr_high_d * 1.015
-                    rsi_weak = r <= 55
+                    rsi_weak = r <= _lpsy_rsi_max  # RSI <= 55 (lub 101 gdy no_rsi=True)
                     low_vol  = v is None or c["volume"] <= v * ST_VOL_RATIO
                     if below_resistance and rsi_weak:
                         # Book: LPSY/test after UTAD should be weaker (lower vol) than UTAD
@@ -1006,12 +1030,13 @@ _LABEL = {
 }
 
 
-def analyze_wyckoff(candles, verbose=False, require_rsi_climax=True):
+def analyze_wyckoff(candles, verbose=False, require_rsi_climax=True, no_rsi=False):
     """
     Drop-in replacement dla starego wyckoff_core.analyze_wyckoff.
     Zwraca ten sam format dict co poprzednia wersja.
 
     require_rsi_climax=False — wyłącza filtr RSI dla SC/BC (tylko wolumen + trend).
+    no_rsi=True — usuwa WSZYSTKIE bramki RSI (SC/BC/AR/ST/SOS/LPS/SOW/LPSY).
     """
     lbl = _LABEL[bool(verbose)]
     n   = len(candles)
@@ -1024,7 +1049,7 @@ def analyze_wyckoff(candles, verbose=False, require_rsi_climax=True):
             "full_trend": "unclear", "recent_trend": "unclear", "ranging": False,
         }
 
-    pts = find_wyckoff_points(candles, require_rsi_climax=require_rsi_climax)
+    pts = find_wyckoff_points(candles, require_rsi_climax=require_rsi_climax, no_rsi=no_rsi)
     acc  = pts["acc"]
     dist = pts["dist"]
     ctx  = pts["context"]

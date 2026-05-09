@@ -105,7 +105,9 @@ def analyze_one(symbol, end_ms, forward_ms):
     fvg  = active.get("_fvg_bias", 0.0)
     hlb  = active.get("_hl_score_bull", 0)
     hlbr = active.get("_hl_score_bear", 0)
-    ar_choch = active.get("AR", {}).get("choch_strength", 1.0) if "AR" in active else 1.0
+    ar_choch    = active.get("AR", {}).get("choch_strength", 1.0) if "AR" in active else 1.0
+    ar_vol_slope = active.get("AR", {}).get("vol_slope", 0.0)   if "AR" in active else 0.0
+    st_above_bc  = active.get("_st_above_bc", False)  # dist only
     spring_type = active.get("Spring", {}).get("spring_type", None) if "Spring" in active else None
     st_pos      = active.get("ST", {}).get("position", None) if "ST" in active else None
     hh_hl_sos   = active.get("SOS", {}).get("hh_hl", None) if "SOS" in active else None
@@ -128,8 +130,10 @@ def analyze_one(symbol, end_ms, forward_ms):
         "fvg_bias":     fvg,
         "hl_bull":      hlb,
         "hl_bear":      hlbr,
-        "ar_choch":     ar_choch,
-        "spring_type":  spring_type,
+        "ar_choch":      ar_choch,
+        "ar_vol_slope":  ar_vol_slope,
+        "st_above_bc":   st_above_bc,
+        "spring_type":   spring_type,
         "st_position":  st_pos,
         "hh_hl_sos":    hh_hl_sos,
     }
@@ -282,7 +286,7 @@ def main():
         print_group(lbl, [r for r in records if pred(r)])
 
     # ── AR ChoCH strength ─────────────────────────────────────────────────────
-    print("\nBY AR CHOCH STRENGTH (Ch.16 — Reaction as Change of Character):")
+    print("\nBY AR CHOCH STRENGTH (Ch.16 — size vs prior swings):")
     choch_buckets = [
         ("AR ChoCH < 0.6  (weak → suspect opposite struct)", lambda r: r["ar_choch"] < 0.60),
         ("AR ChoCH 0.6–1.0 (moderate ChoCH)",               lambda r: 0.60 <= r["ar_choch"] < 1.00),
@@ -291,6 +295,29 @@ def main():
     ]
     for lbl, pred in choch_buckets:
         print_group(lbl, [r for r in records if pred(r)])
+
+    # ── AR volume slope ───────────────────────────────────────────────────────
+    print("\nBY AR VOLUME SLOPE (Ch.16 — declining vol = genuine AR anatomy):")
+    ar_vol_buckets = [
+        ("AR vol_slope < -0.05  (clearly declining = genuine AR)", lambda r: r["ar_vol_slope"] < -0.05),
+        ("AR vol_slope -0.05..+0.02 (neutral)",                    lambda r: -0.05 <= r["ar_vol_slope"] <= 0.02),
+        ("AR vol_slope > +0.02  (rising vol = forced/weak AR)",    lambda r: r["ar_vol_slope"] > 0.02),
+    ]
+    for lbl, pred in ar_vol_buckets:
+        print_group(lbl, [r for r in records if pred(r)])
+
+    # ── ST above BC (dist reaccumulation signal) ──────────────────────────────
+    print("\nBY ST-ABOVE-BC (dist/redist only — Ch.16 reaccumulation signal):")
+    for val, lbl in [(True, "ST above BC = Reaccumulation suspected"), (False, "ST below BC = Distribution confirmed")]:
+        grp = [r for r in records if r["structure"] in BEARISH_STRUCTS and r["st_above_bc"] is val]
+        print_group(lbl, grp)
+
+    # ── AR combined quality (size + vol slope) ────────────────────────────────
+    print("\nAR COMBINED QUALITY (choch_strength > 0.8 AND vol_slope < -0.02):")
+    grp_good = [r for r in records if r["ar_choch"] > 0.8 and r["ar_vol_slope"] < -0.02]
+    grp_weak = [r for r in records if r["ar_choch"] <= 0.8 or  r["ar_vol_slope"] >= -0.02]
+    print_group("AR quality: GOOD (size ✓ + vol declining ✓)", grp_good)
+    print_group("AR quality: WEAK (size or vol fails)",         grp_weak)
 
     # ── Spring type ───────────────────────────────────────────────────────────
     print("\nBY SPRING TYPE (acc structures only):")

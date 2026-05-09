@@ -509,9 +509,14 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
 
         if ar_idx is not None:
             _choch_acc = _ar_choch_strength(candles, sc_idx, ar_idx, is_acc=True)
+            # Volume slope within the AR window (skip SC bar to avoid climax-volume bias).
+            # Book Ch.16: genuine AR has declining volume from start to end — interest fading.
+            # Positive slope = volume rising in AR = forced move, not natural demand exhaustion.
+            _ar_vol_sl_acc = _range_vol_slope(candles, sc_idx + 1, ar_idx) if ar_idx > sc_idx + 2 else 0.0
             acc["AR"] = {"idx": ar_idx, "price": candles[ar_idx]["high"],
                          "rsi": rsi_arr[ar_idx], "volume": candles[ar_idx]["volume"],
-                         "choch_strength": _choch_acc}
+                         "choch_strength": _choch_acc,
+                         "vol_slope":      _ar_vol_sl_acc}
 
             # Wyznacz granice zakresu z SC i AR
             cr_low  = candles[sc_idx]["low"]
@@ -734,15 +739,19 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
 
         if ar_d_idx is not None:
             _choch_dist = _ar_choch_strength(candles, bc_idx, ar_d_idx, is_acc=False)
+            # Volume slope within distribution AR window (skip BC bar to avoid climax-volume bias).
+            _ar_vol_sl_dist = _range_vol_slope(candles, bc_idx + 1, ar_d_idx) if ar_d_idx > bc_idx + 2 else 0.0
             dist["AR"] = {"idx": ar_d_idx, "price": candles[ar_d_idx]["low"],
                           "rsi": rsi_arr[ar_d_idx], "volume": candles[ar_d_idx]["volume"],
-                          "choch_strength": _choch_dist}
+                          "choch_strength": _choch_dist,
+                          "vol_slope":      _ar_vol_sl_dist}
 
             cr_high_d = candles[bc_idx]["high"]
             cr_low_d  = candles[ar_d_idx]["low"]
 
             # ST (dystrybucja): pivot high PO AR + RSI nie wraca powyżej rsi_high + niski wolumen
             st_d_idx = None
+            _st_above_bc = False  # Book Ch.16: ST > BC high = reaccumulation signal
             for i in p_highs:
                 if i <= ar_d_idx:
                     continue
@@ -753,9 +762,13 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
                 if r > rsi_high:
                     break  # nowy BC
                 price_ok = candles[i]["high"] <= cr_high_d * 1.005
-                if price_ok:
-                    st_d_idx = i
+                if not price_ok:
+                    # First pivot after AR exceeds BC high → ST doesn't hold → reaccumulation
+                    _st_above_bc = True
                     break
+                st_d_idx = i
+                break
+            dist["_st_above_bc"] = _st_above_bc
 
             if st_d_idx is not None:
                 dist["ST"] = {"idx": st_d_idx, "price": candles[st_d_idx]["high"],
@@ -1197,6 +1210,11 @@ def analyze_wyckoff(candles, verbose=False, require_rsi_climax=True):
                 confidence = "MEDIUM"
             else:
                 confidence = "LOW"
+
+        # Book Ch.16: ST ending above BC high = demand exceeds supply after reaction → Reaccumulation.
+        # This is a structural confirmation — the BC high did not hold as resistance → cap to LOW.
+        if pts["dist"].get("_st_above_bc", False) and confidence in ("HIGH", "MEDIUM"):
+            confidence = "LOW"
 
         # Backtest finding: Distribution/Redistribution MEDIUM confidence = 38-41% accuracy.
         # MEDIUM for distribution is structurally unreliable unless UTAD+LPSY sequence confirmed.

@@ -187,6 +187,106 @@ def _check_hh_hl(candles, idx, lookback=10):
     return rising >= len(lows) // 2
 
 
+def _fvg_bias_in_range(candles, start_idx, end_idx):
+    """
+    Net FVG (Fair Value Gap / SMC imbalance) bias within a window.
+    Bullish FVG: candle[i].low > candle[i-2].high  (gap up — unfilled demand zone).
+    Bearish FVG: candle[i].high < candle[i-2].low  (gap down — unfilled supply zone).
+    Returns normalized net bias (positive = bullish FVGs dominate, negative = bearish).
+    A strong positive bias inside an accumulation range confirms genuine demand absorption.
+    A strong negative bias inside a distribution range confirms genuine supply.
+    """
+    end_idx = min(end_idx, len(candles) - 1)
+    if end_idx - start_idx < 2:
+        return 0.0
+    bull_size = 0.0
+    bear_size = 0.0
+    for i in range(start_idx + 2, end_idx + 1):
+        gap_up   = candles[i]["low"]   - candles[i - 2]["high"]
+        gap_down = candles[i - 2]["low"] - candles[i]["high"]
+        if gap_up > 0:
+            bull_size += gap_up
+        if gap_down > 0:
+            bear_size += gap_down
+    mid_price = (candles[start_idx]["close"] + candles[end_idx]["close"]) / 2
+    if mid_price == 0:
+        return 0.0
+    return (bull_size - bear_size) / mid_price
+
+
+def _range_hl_score(candles, start_idx, end_idx):
+    """
+    Internal range structure: count pivot Higher Highs + Higher Lows (bull_score)
+    vs Lower Highs + Lower Lows (bear_score) within the trading range.
+    bull_score > bear_score → price building ascending structure inside range (Acc/Reacc).
+    bear_score > bull_score → price building descending structure inside range (Dist/Redist).
+    Uses a 3-bar pivot lookback (tighter than the main PIVOT_LEN for intra-range resolution).
+    """
+    end_idx = min(end_idx, len(candles) - 1)
+    lb = 3
+    window = candles[start_idx:end_idx + 1]
+    n = len(window)
+    if n < lb * 2 + 3:
+        return 0, 0
+    highs, lows = [], []
+    for i in range(lb, n - lb):
+        h = window[i]["high"]
+        l = window[i]["low"]
+        if all(h >= window[i - j]["high"] and h >= window[i + j]["high"] for j in range(1, lb + 1)):
+            highs.append(h)
+        if all(l <= window[i - j]["low"]  and l <= window[i + j]["low"]  for j in range(1, lb + 1)):
+            lows.append(l)
+    bull = (sum(1 for i in range(1, len(highs)) if highs[i] > highs[i - 1]) +
+            sum(1 for i in range(1, len(lows))  if lows[i]  > lows[i - 1]))
+    bear = (sum(1 for i in range(1, len(highs)) if highs[i] < highs[i - 1]) +
+            sum(1 for i in range(1, len(lows))  if lows[i]  < lows[i - 1]))
+    return bull, bear
+
+
+def _ar_choch_strength(candles, climax_idx, ar_idx, is_acc=True):
+    """
+    AR (Automatic Rally/Reaction) as Change of Character strength (Villahermosa Ch.16).
+    Compares the AR distance to the average swing size in the 60 bars before the climax.
+    Book: "an AR of 100pts in a market with avg 50pt swings suggests a stronger bottom."
+    Weak AR (intertwined, short distance) suggests the opposite structure:
+      acc → suspect redistribution; dist → suspect reaccumulation.
+    Returns ratio ≥ 1.0 = strong ChoCH, < 0.6 = weak ChoCH.
+    """
+    if is_acc:
+        ar_size = candles[ar_idx]["high"] - candles[climax_idx]["low"]
+        ref     = candles[climax_idx]["low"]
+    else:
+        ar_size = candles[climax_idx]["high"] - candles[ar_idx]["low"]
+        ref     = candles[climax_idx]["high"]
+
+    if ref <= 0 or ar_size <= 0:
+        return 1.0
+
+    ar_pct = ar_size / ref
+
+    # Average 10-bar high-low range in the 60 bars before climax = proxy for typical swing
+    lookback = 60
+    start = max(0, climax_idx - lookback)
+    window = candles[start:climax_idx]
+    n = len(window)
+    if n < 10:
+        return 1.0
+
+    swing_pcts = []
+    for k in range(0, n - 9, 5):
+        sub = window[k:k + 10]
+        hi  = max(c["high"] for c in sub)
+        lo  = min(c["low"]  for c in sub)
+        mid = (hi + lo) / 2
+        if mid > 0:
+            swing_pcts.append((hi - lo) / mid)
+
+    if not swing_pcts:
+        return 1.0
+    avg_swing = sum(swing_pcts) / len(swing_pcts)
+    return (ar_pct / avg_swing) if avg_swing > 0 else 1.0
+
+
 # ── Linear regression slope ───────────────────────────────────────────────────
 
 def _slope_pct(closes):
@@ -408,8 +508,10 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
             break  # pierwszy pivot high po SC
 
         if ar_idx is not None:
+            _choch_acc = _ar_choch_strength(candles, sc_idx, ar_idx, is_acc=True)
             acc["AR"] = {"idx": ar_idx, "price": candles[ar_idx]["high"],
-                         "rsi": rsi_arr[ar_idx], "volume": candles[ar_idx]["volume"]}
+                         "rsi": rsi_arr[ar_idx], "volume": candles[ar_idx]["volume"],
+                         "choch_strength": _choch_acc}
 
             # Wyznacz granice zakresu z SC i AR
             cr_low  = candles[sc_idx]["low"]
@@ -531,7 +633,7 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
                                       "low_volume": low_vol}
                         break
 
-        # ── Volume analysis across accumulation range ─────────────────────────
+        # ── Volume + SMC analysis across accumulation range ──────────────────
         if "SC" in acc:
             _sc_i = acc["SC"]["idx"]
             _latest_i = max((v["idx"] for v in acc.values() if isinstance(v, dict) and "idx" in v), default=_sc_i)
@@ -548,6 +650,12 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
                     _pivots.append((acc[_key]["idx"], _dir))
             _pivots.sort()
             acc["_wave_vol_ratio"] = _wave_vol_ratio(candles, _pivots) if len(_pivots) >= 2 else 1.0
+
+            # SMC: FVG bias and internal HH/HL structure within the range
+            acc["_fvg_bias"] = _fvg_bias_in_range(candles, _sc_i, _latest_i)
+            _hl_bull, _hl_bear = _range_hl_score(candles, _sc_i, _latest_i)
+            acc["_hl_score_bull"] = _hl_bull
+            acc["_hl_score_bear"] = _hl_bear
 
     # ════════════════════════════════════════════════════════════════════════
     # DYSTRYBUCJA: BC → AR → ST → UTAD → SOW → LPSY
@@ -625,8 +733,10 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
             break
 
         if ar_d_idx is not None:
+            _choch_dist = _ar_choch_strength(candles, bc_idx, ar_d_idx, is_acc=False)
             dist["AR"] = {"idx": ar_d_idx, "price": candles[ar_d_idx]["low"],
-                          "rsi": rsi_arr[ar_d_idx], "volume": candles[ar_d_idx]["volume"]}
+                          "rsi": rsi_arr[ar_d_idx], "volume": candles[ar_d_idx]["volume"],
+                          "choch_strength": _choch_dist}
 
             cr_high_d = candles[bc_idx]["high"]
             cr_low_d  = candles[ar_d_idx]["low"]
@@ -715,7 +825,7 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
                                         "utad_test_weak": _utad_test_weak}
                         break
 
-        # ── Volume analysis across distribution range ─────────────────────────
+        # ── Volume + SMC analysis across distribution range ───────────────────
         if "BC" in dist:
             _bc_i = dist["BC"]["idx"]
             _latest_i = max((v["idx"] for v in dist.values() if isinstance(v, dict) and "idx" in v), default=_bc_i)
@@ -732,6 +842,12 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
                     _pivots.append((dist[_key]["idx"], _dir))
             _pivots.sort()
             dist["_wave_vol_ratio"] = _wave_vol_ratio(candles, _pivots) if len(_pivots) >= 2 else 1.0
+
+            # SMC: FVG bias and internal LH/LL structure within the range
+            dist["_fvg_bias"] = _fvg_bias_in_range(candles, _bc_i, _latest_i)
+            _hl_bull_d, _hl_bear_d = _range_hl_score(candles, _bc_i, _latest_i)
+            dist["_hl_score_bull"] = _hl_bull_d
+            dist["_hl_score_bear"] = _hl_bear_d
 
     # ── Walidacja wzorca — czy pattern jest jeszcze aktualny? ───────────────────
     # Sprawdza aktualną cenę względem wykrytego range'u.
@@ -1007,6 +1123,10 @@ def analyze_wyckoff(candles, verbose=False, require_rsi_climax=True):
         _rvs = pts["acc"].get("_range_vol_slope", 0.0)
         _spring = pts["acc"].get("Spring", {})
         _spring_type = _spring.get("spring_type", 2) if _spring else 2
+        _fvg_b  = pts["acc"].get("_fvg_bias", 0.0)
+        _hl_b   = pts["acc"].get("_hl_score_bull", 0)
+        _hl_bear_acc = pts["acc"].get("_hl_score_bear", 0)
+        _ar_choch_acc = pts["acc"].get("AR", {}).get("choch_strength", 1.0) if "AR" in pts["acc"] else 1.0
 
         # Spring Type 3 (exhaustion, low vol) is the strongest signal — boost confidence
         if "Spring" in pts["acc"] and _spring_type == 3 and confidence == "LOW":
@@ -1016,14 +1136,33 @@ def analyze_wyckoff(candles, verbose=False, require_rsi_climax=True):
         if "Spring" in pts["acc"] and _spring_type == 1 and confidence == "HIGH" and "LPS" not in pts["acc"]:
             confidence = "MEDIUM"
 
-        # Wave vol ratio < 0.8 in "accumulation" context = down-legs dominate
-        # Suspicious — may actually be distribution. Cap confidence.
+        # Wave vol ratio < 0.8 in "accumulation" context = down-legs dominate → suspicious
         if _wvr < 0.80 and confidence == "HIGH":
             confidence = "MEDIUM"
 
+        # SMC: bullish FVG bias within range confirms genuine demand absorption
+        if _fvg_b > 0.002 and _hl_b > _hl_bear_acc and confidence == "MEDIUM":
+            confidence = "HIGH"  # FVG + HH/HL confirm structure → upgrade
+
+        # SMC: bearish FVG dominance inside supposed accumulation = suspicious → cap
+        if _fvg_b < -0.002 and confidence == "HIGH":
+            confidence = "MEDIUM"
+
+        # ChoCH (Ch.16): weak AR in accumulation → suspects redistribution, cap confidence.
+        # Book: "short-distance, intertwined AR with no volume peak → think redistribution."
+        # NOTE: strong AR boost (>1.5 → HIGH) was tested and showed 48.3% accuracy (below random)
+        # → only the downside cap is retained. Backtest: weak AR shows 50% (neutral → safe cap).
+        if _ar_choch_acc < 0.60:
+            if confidence == "HIGH":
+                confidence = "MEDIUM"
+            elif confidence == "MEDIUM":
+                confidence = "LOW"
+
     elif ctx == "distribution":
-        _wvr = pts["dist"].get("_wave_vol_ratio", 1.0)
-        _rvs = pts["dist"].get("_range_vol_slope", 0.0)
+        _wvr  = pts["dist"].get("_wave_vol_ratio", 1.0)
+        _rvs  = pts["dist"].get("_range_vol_slope", 0.0)
+        _fvg_d = pts["dist"].get("_fvg_bias", 0.0)
+        _ar_choch_dist = pts["dist"].get("AR", {}).get("choch_strength", 1.0) if "AR" in pts["dist"] else 1.0
 
         # Signal 1 (Villahermosa Ch.9): if up-legs dominate volume = Reaccumulation, not Distribution.
         # WVR > 1.5 alone is sufficient — price is absorbing supply, not distributing.
@@ -1039,15 +1178,34 @@ def analyze_wyckoff(candles, verbose=False, require_rsi_climax=True):
             elif confidence == "MEDIUM":
                 confidence = "LOW"
 
-        # Signal 2: strongly bearish wave vol (down-legs carry 25%+ more vol) confirms
-        # genuine distribution — boost Phase D structures from LOW to MEDIUM.
-        if _wvr < 0.80 and "SOW" in pts["dist"] and confidence == "LOW":
-            confidence = "MEDIUM"
-
-        # Signal 3: LPSY weaker than UTAD confirms genuine distribution Phase D
+        # Signal 2: LPSY weaker than UTAD confirms genuine distribution Phase D
+        # (kept from original logic — structural confirmation from sequence, not volume alone)
         if "LPSY" in pts["dist"] and "UTAD" in pts["dist"]:
             if pts["dist"]["LPSY"].get("utad_test_weak", False) and confidence == "MEDIUM":
                 confidence = "HIGH"
+
+        # SMC: bullish FVG inside distribution range → price absorbing supply = Reacc signal
+        # Backtest result: distributions with bullish FVG had ~22% directional accuracy → cap.
+        if _fvg_d > 0.002 and confidence in ("HIGH", "MEDIUM"):
+            confidence = "LOW"
+
+        # ChoCH (Ch.16): weak AR (downward reaction after BC) in distribution → reaccumulation.
+        # Book: "weak/intertwined AR, no volume peak, ST above BC → reaccumulation suspected."
+        # Only cap; no boosts for distribution (backtest showed boosts unreliable in bull market).
+        if _ar_choch_dist < 0.60 and confidence in ("HIGH", "MEDIUM"):
+            if confidence == "HIGH":
+                confidence = "MEDIUM"
+            else:
+                confidence = "LOW"
+
+        # Backtest finding: Distribution/Redistribution MEDIUM confidence = 38-41% accuracy.
+        # MEDIUM for distribution is structurally unreliable unless UTAD+LPSY sequence confirmed.
+        # Without that structural proof, cap MEDIUM→LOW to avoid misleadingly confident signals.
+        if confidence == "MEDIUM":
+            has_utad_lpsy = ("UTAD" in pts["dist"] and "LPSY" in pts["dist"] and
+                             pts["dist"]["LPSY"].get("utad_test_weak", False))
+            if not has_utad_lpsy:
+                confidence = "LOW"
 
     # Zakres
     ranging = False

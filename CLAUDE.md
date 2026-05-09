@@ -51,17 +51,41 @@ result = analyze_wyckoff(candles, verbose=False)
 
 Sequential detection: `SC → AR → ST → Spring → SOS → LPS` (accumulation) / `BC → AR → ST → UTAD → SOW → LPSY` (distribution).
 
-- **SC**: pivot low + RSI < 30 + volume ≥ 1.5× SMA(20) + bearish candle
+- **SC**: pivot low + RSI < 30 + volume ≥ 1.5× SMA(20) + bearish candle + pre-20-bar trend must not be bullish
 - **AR**: first pivot high after SC with RSI exiting bear zone
 - **ST**: first pivot low after AR with price ≥ SC low × 0.995 (no new climax)
-- **Spring**: pivot low after ST with low < range_low but close > range_low (false break)
-- **SOS**: pivot high after Spring/ST with close > AR high × 1.001 + RSI > 50
+- **Spring**: pivot low after ST with low < range_low × (1 − 0.3%) but close > range_low (false break; min penetration prevents 1-tick fakes)
+- **SOS**: pivot high after Spring/ST with close > AR high × **1.01** + RSI > **55**
 - **LPS**: pivot low after SOS with low ≥ AR high × 0.985 + RSI ≥ 40
-- **BC/UTAD/SOW/LPSY**: mirror logic for distribution
+- **BC**: pivot high + RSI > 70 + volume ≥ 1.5× SMA(20) + bullish candle + pre-20-bar trend must not be bearish
+- **UTAD**: pivot high after ST with high > range_high × (1 + 0.3%) but close < range_high (false break)
+- **SOW**: pivot low after UTAD/ST with close < AR low × **0.99** + RSI < **45**
+- **LPSY**: mirror of LPS for distribution
+
+**`find_wyckoff_points` signature:**
+```python
+def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require_rsi_climax=True):
+```
+`require_rsi_climax=False` bypasses RSI gates on SC/BC (useful for testing volume-only detection).
 
 **Context selection (Błąd 1 fix):** when both `acc` (SC found) and `dist` (BC found) are detected simultaneously, the winner is chosen by **sequence score** (how many points confirmed), not by SC.idx vs BC.idx. Tiebreak: whichever direction's last detected point is later.
 
-**`struct_trend` (Błąd 2 fix):** trend used for Accumulation vs Reaccumulation (and Distribution vs Redistribution) classification is computed on candles **before SC/BC**, not on the full 60-bar window. This prevents a post-SOS rally from causing a true Accumulation to be mislabelled as Reaccumulation.
+**`struct_trend` (Błąd 2 fix):** computed on candles **before SC/BC** (not the full window), using `_multi_trend()`. This prevents a post-SOS rally from mislabelling a true Accumulation as Reaccumulation.
+
+**`_multi_trend(candles, skip_last=5)`:** votes across 30/60/120-bar windows; requires ≥ 2/3 votes for `"bearish"` or `"bullish"`, otherwise returns `"neutral"`. `skip_last` removes the most recent bars before voting (avoids contamination from the event being classified).
+
+**Accumulation / Reaccumulation classification:**
+- `struct_trend == "bearish"` → **Accumulation** (was in downtrend before SC)
+- `struct_trend == "bullish"` or `"neutral"` → **Reaccumulation** (bullish bias; backtested at 62.7% F30 accuracy)
+
+**Distribution / Redistribution classification (Phase-aware):**
+- `struct_trend == "bullish"` → **Distribution**
+- `struct_trend == "bearish"` → **Redistribution**
+- `struct_trend == "neutral"` → ambiguous; resolved by phase:
+  - Phase C/D (UTAD or SOW/LPSY confirmed) → **Redistribution** (confirmed breakout overrides ambiguity)
+  - Phase A/B only → **UNCLEAR** (43.6% accuracy in neutral cases — below random; not shown)
+
+**Phase A without AR → UNCLEAR:** only SC/BC detected with no subsequent AR means it's too early to classify — returns `structure="UNCLEAR"`, `phase="Unclear"`, `confidence="LOW"` instead of a premature label.
 
 **Tuning constants (all at module top — edit here, never inline):**
 
@@ -75,6 +99,8 @@ Sequential detection: `SC → AR → ST → Spring → SOS → LPS` (accumulatio
 | `RANGE_SPAN_MAX` | 0.25 | `(high−low)/avg` < this for a range window |
 | `RANGE_SLOPE_MAX` | 0.010 | `\|slope\| / avg_price` per bar |
 | `_MIN_CANDLES` | 30 | minimum candles; fewer → returns `Insufficient` |
+| `SC_BC_PRETREND_BARS` | 20 | bars before SC/BC to check pre-climax trend; SC rejected if pre-trend is bullish, BC rejected if bearish |
+| `UTAD_SPRING_MIN_PCT` | 0.003 | Spring/UTAD must penetrate range boundary by ≥ 0.3% (prevents 1-tick false breaks) |
 
 **Confidence:** graduated caps via `_CONF_CAPS` — `n < 45` → LOW, `n < 70` → MEDIUM, `n ≥ 70` → unrestricted.
 

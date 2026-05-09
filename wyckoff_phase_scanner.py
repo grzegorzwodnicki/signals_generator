@@ -20,7 +20,8 @@ from wyckoff_core import analyze_wyckoff
 OUTPUT_DIR = "output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-BACKTEST_TIME_MS = None
+BACKTEST_TIME_MS   = None
+REQUIRE_RSI_CLIMAX = True   # set False via prompt to disable RSI gate on SC/BC
 
 TIMEFRAMES = ["5m", "15m", "30m", "1H", "4H", "1D", "1W"]
 TF_LABEL   = {"5m": "5M", "15m": "15M", "30m": "30M", "1H": "1H", "4H": "4H", "1D": "1D", "1W": "1W"}
@@ -301,7 +302,7 @@ def _check_conditions(data_by_tf, conditions):
         candles   = data_by_tf.get(tf, [])
         if len(candles) < 20:
             return False, None, {}
-        wy = analyze_wyckoff(candles)
+        wy = analyze_wyckoff(candles, require_rsi_climax=REQUIRE_RSI_CLIMAX)
         if not _matches(wy, phases, direction):
             return False, None, {}
         wyckoff_by_tf[tf] = wy
@@ -391,8 +392,8 @@ def _wyckoff_points_panel(w, candles=None):
         return ""
 
     events   = pts["acc"] if is_acc else pts["dist"]
-    pt_order = (["SC", "AR", "ST", "Spring", "SOS", "LPS"] if is_acc
-                else ["BC", "AR", "ST", "UTAD", "SOW", "LPSY"])
+    pt_order = (["PS", "SC", "AR", "ST", "Spring", "SOS", "LPS"] if is_acc
+                else ["PSY", "BC", "AR", "ST", "UTAD", "SOW", "LPSY"])
     vsma     = pts.get("vol_sma", [])
 
     items = ""
@@ -459,7 +460,7 @@ def _multi_tf_table(data_by_tf, highlight_tfs=None):
                 f'<td colspan="7" style="color:#334455">No data</td></tr>'
             )
             continue
-        w   = analyze_wyckoff(candles)
+        w   = analyze_wyckoff(candles, require_rsi_climax=REQUIRE_RSI_CLIMAX)
         sc  = STRUCT_COLOR.get(w["structure"], "#556677")
         cc  = CONF_COLOR.get(w["confidence"], "#8899aa")
         rh  = _f(w["range_high"])
@@ -617,7 +618,7 @@ def generate_html(matches, scan_config, report_time, data_time, is_backtest):
         if multi_mode:
             for cond in conditions:
                 ctf  = cond["tf"]
-                cwy  = analyze_wyckoff(m["data_by_tf"].get(ctf, []))
+                cwy  = analyze_wyckoff(m["data_by_tf"].get(ctf, []), require_rsi_climax=REQUIRE_RSI_CLIMAX)
                 csc  = STRUCT_COLOR.get(cwy["structure"], "#556677")
                 cond_ranges += (
                     f'<span style="margin-right:16px;font-size:12px">'
@@ -814,6 +815,13 @@ def main():
         ))
         print("Skaner znajdzie instrumenty pasujące do WSZYSTKICH warunków w tym samym kierunku."
               " (Accumulation == Reaccumulation, Distribution == Redistribution)")
+
+    # ── RSI toggle ──
+    global REQUIRE_RSI_CLIMAX
+    rsi_raw = input("\nFiltr RSI dla SC/BC? (Enter=tak / n=wyłącz RSI): ").strip().lower()
+    REQUIRE_RSI_CLIMAX = (rsi_raw != "n")
+    if not REQUIRE_RSI_CLIMAX:
+        print("  RSI wyłączone — detekcja SC/BC tylko na podstawie wolumenu i trendu.")
 
     # ── Time mode ──
     choice      = input("\nDane (t=teraz / h=historyczne): ").strip().lower()

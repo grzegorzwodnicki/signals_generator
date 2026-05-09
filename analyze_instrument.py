@@ -13,8 +13,10 @@ import subprocess
 from datetime import datetime, timezone
 from wyckoff_core import analyze_wyckoff as _analyze_wyckoff_core
 
+REQUIRE_RSI_CLIMAX = True   # set False via prompt to disable RSI gate on SC/BC
+
 def analyze_wyckoff(candles):
-    return _analyze_wyckoff_core(candles, verbose=True)
+    return _analyze_wyckoff_core(candles, verbose=True, require_rsi_climax=REQUIRE_RSI_CLIMAX)
 
 OUTPUT_DIR = "output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -1117,8 +1119,8 @@ def generate_report(symbol, data_by_tf, report_time, data_time, is_backtest):
         if not (is_acc or is_dist):
             continue
         events   = pts["acc"] if is_acc else pts["dist"]
-        pt_order = (["SC", "AR", "ST", "Spring", "SOS", "LPS"] if is_acc
-                    else ["BC", "AR", "ST", "UTAD", "SOW", "LPSY"])
+        pt_order = (["PS", "SC", "AR", "ST", "Spring", "SOS", "LPS"] if is_acc
+                    else ["PSY", "BC", "AR", "ST", "UTAD", "SOW", "LPSY"])
         vsma_arr = pts.get("vol_sma", [])
         detected = [k for k in pt_order if k in events]
         if not detected:
@@ -1179,7 +1181,7 @@ def generate_report(symbol, data_by_tf, report_time, data_time, is_backtest):
 
     pt_headers = "".join(
         f'<th style="color:#334455;padding:6px;min-width:85px">{k}</th>'
-        for k in ["SC/BC", "AR", "ST", "Spring/UTAD", "SOS/SOW", "LPS/LPSY"]
+        for k in ["PS/PSY", "SC/BC", "AR", "ST", "Spring/UTAD", "SOS/SOW", "LPS/LPSY"]
     )
     wyckoff_pts_html = ""
     if wy_pts_rows:
@@ -1664,6 +1666,12 @@ def main():
             symbol += "USDT"
             print(f"  → {symbol}")
         fetch_fn = get_candles
+
+    global REQUIRE_RSI_CLIMAX
+    rsi_raw = input("Filtr RSI dla SC/BC? (Enter=tak / n=wyłącz RSI): ").strip().lower()
+    REQUIRE_RSI_CLIMAX = (rsi_raw != "n")
+    if not REQUIRE_RSI_CLIMAX:
+        print("  RSI wyłączone — detekcja SC/BC tylko na podstawie wolumenu i trendu.")
 
     choice = input("Dane teraźniejsze czy historyczne? (t=teraz / h=historyczne): ").strip().lower()
     is_backtest = False

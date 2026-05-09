@@ -47,6 +47,13 @@ _MIN_CANDLES = 30
 VALIDITY_PHASE_E_MULT    = 2.0
 VALIDITY_INVALIDATE_MULT = 0.5
 
+# Detekcja klimaksu — jakość SC/BC
+# SC/BC muszą pojawić się po trendzie zgodnym z kierunkiem (SC po bearish, BC po bullish).
+# Odrzucamy BC w środku trendu spadkowego i SC w środku trendu wzrostowego.
+SC_BC_PRETREND_BARS = 20   # liczba świec PRZED SC/BC do oceny poprzedniego trendu
+# Spring/UTAD — minimalne przebicie granicy zakresu
+UTAD_SPRING_MIN_PCT = 0.003  # Spring/UTAD musi przekroczyć granicę o co najmniej 0.3%
+
 # ── RSI ───────────────────────────────────────────────────────────────────────
 
 def _rsi(closes, period=14):
@@ -136,6 +143,32 @@ def _trend(candles, lookback=30):
     if s < f * 0.985:  return "bearish"
     return "neutral"
 
+def _multi_trend(candles, skip_last=5):
+    """
+    Multi-window trend consensus: checks 30, 60, 120 bars, skipping the last
+    skip_last bars (to exclude the climax itself from biasing the result).
+    Returns 'bearish', 'bullish', or 'neutral'.
+    Requires at least 2/3 windows to agree for a clear signal.
+    """
+    win_end = len(candles) - skip_last
+    if win_end < 20:
+        return "neutral"
+    segment = candles[:win_end]
+    n = len(segment)
+    votes = []
+    for w in [30, 60, 120]:
+        if n >= w:
+            votes.append(_trend(segment, w))
+    if not votes:
+        return "neutral"
+    bear = votes.count("bearish")
+    bull = votes.count("bullish")
+    if bear >= 2:
+        return "bearish"
+    if bull >= 2:
+        return "bullish"
+    return "neutral"
+
 # ── Confidence cap ────────────────────────────────────────────────────────────
 
 def _cap_conf(confidence, n_candles):
@@ -182,7 +215,7 @@ def _rsi_zone(rsi_val, sens=RSI_SENS):
 # GŁÓWNA FUNKCJA — DETEKCJA PUNKTÓW WYCKOFFA
 # ══════════════════════════════════════════════════════════════════════════════
 
-def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS):
+def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require_rsi_climax=True):
     """
     Wykrywa sekwencyjnie punkty Wyckoffa na liście świec.
 
@@ -239,8 +272,8 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS):
         v = vsma[i]
         if r is None or v is None:
             continue
-        # RSI w strefie bear przy pivot low
-        if r >= rsi_low:
+        # RSI w strefie bear przy pivot low (opcjonalne — wyłącz przy require_rsi_climax=False)
+        if require_rsi_climax and r >= rsi_low:
             continue
         # Wolumen >= SC_VOL_MULT * sma(vol,20)
         if candles[i]["volume"] < v * SC_VOL_MULT:
@@ -250,9 +283,28 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS):
         is_bearish_candle = c["close"] < c["open"] or (c["open"] - c["low"]) > (c["high"] - c["low"]) * 0.4
         if not is_bearish_candle:
             continue
+        # SC musi pojawić się po trendzie bearish/neutral — nie może być w środku rajdu
+        pre = _trend(candles[max(0, i - SC_BC_PRETREND_BARS):i], SC_BC_PRETREND_BARS)
+        if pre == "bullish":
+            continue
         sc_idx = i  # bierzemy ostatni spełniający (najbardziej aktualny)
 
     if sc_idx is not None:
+        # PS: ostatni pivot low PRZED SC z podwyższonym wolumenem
+        # (Preliminary Support — pierwsze ślady popytu wchodzącego podczas spadku)
+        for i in reversed([j for j in p_lows if j < sc_idx]):
+            v = vsma[i]
+            if v is None:
+                continue
+            c = candles[i]
+            if c["low"] <= candles[sc_idx]["low"]:  # PS musi być wyżej niż SC
+                continue
+            if c["volume"] < v * 0.8:
+                continue
+            acc["PS"] = {"idx": i, "price": c["low"],
+                         "rsi": rsi_arr[i], "volume": c["volume"]}
+            break
+
         acc["SC"] = {"idx": sc_idx, "price": candles[sc_idx]["low"],
                      "rsi": rsi_arr[sc_idx], "volume": candles[sc_idx]["volume"]}
 
@@ -319,8 +371,8 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS):
                     if r is None:
                         continue
                     c = candles[i]
-                    # Fałszywe wybicie: low < cr_low ale close > cr_low
-                    if c["low"] < cr_low and c["close"] > cr_low:
+                    # Fałszywe wybicie: low musi przekroczyć cr_low o min. UTAD_SPRING_MIN_PCT
+                    if c["low"] < cr_low * (1 - UTAD_SPRING_MIN_PCT) and c["close"] > cr_low:
                         low_vol = v is None or c["volume"] <= v * 0.9
                         acc["Spring"] = {"idx": i, "price": c["low"],
                                          "close": c["close"],
@@ -341,8 +393,8 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS):
                     if r is None:
                         continue
                     c = candles[i]
-                    above_cr = c["close"] > cr_high * 1.001
-                    bull_rsi  = r > 50  # RSI przekracza środek
+                    above_cr = c["close"] > cr_high * 1.01
+                    bull_rsi  = r > 55  # RSI przekracza środek (stricter)
                     hi_vol    = v is None or c["volume"] >= v * 1.0
                     if above_cr and bull_rsi:
                         acc["SOS"] = {"idx": i, "price": c["high"],
@@ -386,7 +438,8 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS):
         v = vsma[i]
         if r is None or v is None:
             continue
-        if r <= rsi_high:
+        # RSI w strefie bull przy pivot high (opcjonalne — wyłącz przy require_rsi_climax=False)
+        if require_rsi_climax and r <= rsi_high:
             continue
         if candles[i]["volume"] < v * BC_VOL_MULT:
             continue
@@ -394,9 +447,28 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS):
         is_bullish_candle = c["close"] > c["open"] or (c["high"] - c["close"]) < (c["high"] - c["low"]) * 0.3
         if not is_bullish_candle:
             continue
+        # BC musi pojawić się po trendzie bullish/neutral — nie może być w środku trendu spadkowego
+        pre = _trend(candles[max(0, i - SC_BC_PRETREND_BARS):i], SC_BC_PRETREND_BARS)
+        if pre == "bearish":
+            continue
         bc_idx = i
 
     if bc_idx is not None:
+        # PSY: ostatni pivot high PRZED BC z podwyższonym wolumenem
+        # (Preliminary Supply — pierwsze ślady podaży wchodzące podczas rajdu)
+        for i in reversed([j for j in p_highs if j < bc_idx]):
+            v = vsma[i]
+            if v is None:
+                continue
+            c = candles[i]
+            if c["high"] >= candles[bc_idx]["high"]:  # PSY musi być niżej niż BC
+                continue
+            if c["volume"] < v * 0.8:
+                continue
+            dist["PSY"] = {"idx": i, "price": c["high"],
+                           "rsi": rsi_arr[i], "volume": c["volume"]}
+            break
+
         dist["BC"] = {"idx": bc_idx, "price": candles[bc_idx]["high"],
                       "rsi": rsi_arr[bc_idx], "volume": candles[bc_idx]["volume"]}
 
@@ -448,7 +520,8 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS):
                 if i <= utad_start:
                     continue
                 c = candles[i]
-                if c["high"] > cr_high_d and c["close"] < cr_high_d:
+                # UTAD musi przekroczyć BC high o min. UTAD_SPRING_MIN_PCT (nie wystarczy 1 tick)
+                if c["high"] > cr_high_d * (1 + UTAD_SPRING_MIN_PCT) and c["close"] < cr_high_d:
                     v = vsma[i]
                     low_vol = v is None or c["volume"] <= v * 0.9
                     dist["UTAD"] = {"idx": i, "price": c["high"],
@@ -469,8 +542,8 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS):
                     if r is None:
                         continue
                     c = candles[i]
-                    below_cr = c["close"] < cr_low_d * 0.999
-                    bear_rsi  = r < 50
+                    below_cr = c["close"] < cr_low_d * 0.99
+                    bear_rsi  = r < 45
                     if below_cr and bear_rsi:
                         dist["SOW"] = {"idx": i, "price": c["low"],
                                        "close": c["close"],
@@ -542,8 +615,8 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS):
     if has_acc and has_dist:
         # Porównaj dojrzałość sekwencji — wygrywa ta z więcej potwierdzonymi punktami.
         # Indeks ostatniego punktu jako tiebreaker (nie SC vs BC — to błąd kierunku).
-        ACC_SEQ  = ["SC", "AR", "ST", "Spring", "SOS", "LPS"]
-        DIST_SEQ = ["BC", "AR", "ST", "UTAD",   "SOW", "LPSY"]
+        ACC_SEQ  = ["PS", "SC", "AR", "ST", "Spring", "SOS", "LPS"]
+        DIST_SEQ = ["PSY", "BC", "AR", "ST", "UTAD",  "SOW", "LPSY"]
         acc_score  = sum(1 for k in ACC_SEQ  if k in acc)
         dist_score = sum(1 for k in DIST_SEQ if k in dist)
 
@@ -579,6 +652,7 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS):
 
 _LABEL = {
     False: {
+        "ps": "PS",                  "psy": "PSY",
         "sc": "SC (Selling Climax)", "bc": "BC (Buying Climax)",
         "spring": "Spring",          "utad": "UTAD",
         "sos": "SOS",                "sow": "SOW",
@@ -586,6 +660,7 @@ _LABEL = {
         "none": "No clear events",
     },
     True: {
+        "ps": "PS (Preliminary Support)",      "psy": "PSY (Preliminary Supply)",
         "sc": "Possible SC (Selling Climax)",  "bc": "Possible BC (Buying Climax)",
         "spring": "Spring (test below support)", "utad": "UTAD (test above resistance)",
         "sos": "SOS — break above range high",   "sow": "SOW — break below range low",
@@ -595,10 +670,12 @@ _LABEL = {
 }
 
 
-def analyze_wyckoff(candles, verbose=False):
+def analyze_wyckoff(candles, verbose=False, require_rsi_climax=True):
     """
     Drop-in replacement dla starego wyckoff_core.analyze_wyckoff.
     Zwraca ten sam format dict co poprzednia wersja.
+
+    require_rsi_climax=False — wyłącza filtr RSI dla SC/BC (tylko wolumen + trend).
     """
     lbl = _LABEL[bool(verbose)]
     n   = len(candles)
@@ -611,7 +688,7 @@ def analyze_wyckoff(candles, verbose=False):
             "full_trend": "unclear", "recent_trend": "unclear", "ranging": False,
         }
 
-    pts = find_wyckoff_points(candles)
+    pts = find_wyckoff_points(candles, require_rsi_climax=require_rsi_climax)
     acc  = pts["acc"]
     dist = pts["dist"]
     ctx  = pts["context"]
@@ -631,13 +708,13 @@ def analyze_wyckoff(candles, verbose=False):
     _bc_idx   = pts["dist"].get("BC",  {}).get("idx")
 
     if ctx == "accumulation" and _sc_idx is not None:
-        # Trend przed SC — to jest kontekst wejścia w akumulację
+        # Multi-window trend PRZED SC (pomijamy ostatnie 5 świec żeby nie wliczać samego SC)
         _pre_sc = candles[:_sc_idx] if _sc_idx > 20 else candles
-        struct_trend = _trend(_pre_sc, min(60, len(_pre_sc)))
+        struct_trend = _multi_trend(_pre_sc, skip_last=5)
     elif ctx == "distribution" and _bc_idx is not None:
-        # Trend przed BC
+        # Multi-window trend PRZED BC
         _pre_bc = candles[:_bc_idx] if _bc_idx > 20 else candles
-        struct_trend = _trend(_pre_bc, min(60, len(_pre_bc)))
+        struct_trend = _multi_trend(_pre_bc, skip_last=5)
     else:
         struct_trend = full_trend
 
@@ -651,11 +728,13 @@ def analyze_wyckoff(candles, verbose=False):
     }
     events = []
     if ctx == "accumulation":
+        if "PS"     in acc: events.append(lbl["ps"])
         if "SC"     in acc: events.append(lbl["sc"])
         if "Spring" in acc: events.append(lbl["spring"])
         if "SOS"    in acc: events.append(lbl["sos"])
         if "LPS"    in acc: events.append(lbl["lps"])
     elif ctx == "distribution":
+        if "PSY"  in dist: events.append(lbl["psy"])
         if "BC"   in dist: events.append(lbl["bc"])
         if "UTAD" in dist: events.append(lbl["utad"])
         if "SOW"  in dist: events.append(lbl["sow"])
@@ -667,8 +746,14 @@ def analyze_wyckoff(candles, verbose=False):
 
     # ── Faza i struktura ──────────────────────────────────────────────────────
     # struct_trend: trend PRZED SC/BC — kontekst który decyduje o Acc vs Reacc
+    # neutral → UNCLEAR zamiast zgadywania (Redistribution 43% < losowego)
     if ctx == "accumulation":
-        _acc_base = "Accumulation" if struct_trend == "bearish" else "Reaccumulation"
+        # neutral → Reaccumulation (backtest: 62.7% directional accuracy — wiarygodny sygnał)
+        if struct_trend == "bearish":
+            _acc_base = "Accumulation"
+        else:
+            _acc_base = "Reaccumulation"  # bullish lub neutral — oba bullish-bias
+
         if "LPS" in acc or "SOS" in acc:
             structure = _acc_base
             phase = "D"
@@ -682,29 +767,52 @@ def analyze_wyckoff(candles, verbose=False):
             structure = _acc_base
             phase = "B"
             confidence = "LOW"
-        else:
+        elif "AR" in acc:
             structure = _acc_base
             phase = "A"
             confidence = "LOW"
+        else:
+            structure = "UNCLEAR"
+            phase = "Unclear"
+            confidence = "LOW"
 
     elif ctx == "distribution":
-        _dist_base = "Distribution" if struct_trend == "bullish" else "Redistribution"
+        # neutral przed BC → UNCLEAR tylko dla faz A/B.
+        # Fazy C/D (potwierdzony breakout: UTAD/SOW) pokazuj zawsze — mają konkretny sygnał.
+        if struct_trend == "bullish":
+            _dist_base = "Distribution"
+        elif struct_trend == "bearish":
+            _dist_base = "Redistribution"
+        else:
+            _dist_base = None  # neutral — decyzja zależy od fazy
+
         if "LPSY" in dist or "SOW" in dist:
-            structure = _dist_base
+            # Phase D: potwierdzony breakdown — pokazuj nawet przy neutral trend
+            structure = _dist_base or "Redistribution"
             phase = "D"
             confidence = "HIGH" if ("UTAD" in dist and "LPSY" in dist) else \
                          "MEDIUM" if ("UTAD" in dist or "LPSY" in dist) else "LOW"
         elif "UTAD" in dist:
-            structure = _dist_base
+            # Phase C: false break potwierdzony — zachowaj
+            structure = _dist_base or "Redistribution"
             phase = "C"
             confidence = "MEDIUM"
+        elif _dist_base is None:
+            # Fazy A/B bez jasnego trendu poprzedzającego → UNCLEAR
+            structure = "UNCLEAR"
+            phase = "Unclear"
+            confidence = "LOW"
         elif "ST" in dist:
             structure = _dist_base
             phase = "B"
             confidence = "LOW"
-        else:
+        elif "AR" in dist:
             structure = _dist_base
             phase = "A"
+            confidence = "LOW"
+        else:
+            structure = "UNCLEAR"
+            phase = "Unclear"
             confidence = "LOW"
 
     else:

@@ -105,12 +105,17 @@ def analyze_one(symbol, end_ms, forward_ms):
     fvg  = active.get("_fvg_bias", 0.0)
     hlb  = active.get("_hl_score_bull", 0)
     hlbr = active.get("_hl_score_bear", 0)
-    ar_choch    = active.get("AR", {}).get("choch_strength", 1.0) if "AR" in active else 1.0
-    ar_vol_slope = active.get("AR", {}).get("vol_slope", 0.0)   if "AR" in active else 0.0
-    st_above_bc  = active.get("_st_above_bc", False)  # dist only
-    spring_type = active.get("Spring", {}).get("spring_type", None) if "Spring" in active else None
-    st_pos      = active.get("ST", {}).get("position", None) if "ST" in active else None
-    hh_hl_sos   = active.get("SOS", {}).get("hh_hl", None) if "SOS" in active else None
+    ar_choch      = active.get("AR", {}).get("choch_strength", 1.0) if "AR" in active else 1.0
+    ar_vol_slope  = active.get("AR", {}).get("vol_slope", 0.0)     if "AR" in active else 0.0
+    ar_vol_anatomy = active.get("AR", {}).get("vol_anatomy", 1.0)  if "AR" in active else 1.0
+    # Book Ch.16: ar_confirmed = SC/BC was confirmed by AR (ChoCH)
+    climax_key = "SC" if struct in BULLISH_STRUCTS else "BC"
+    ar_confirmed  = active.get(climax_key, {}).get("ar_confirmed", True)
+    st_above_bc   = active.get("_st_above_bc", False)   # dist path only
+    st_below_sc   = active.get("_st_below_sc", False)   # acc path only
+    spring_type   = active.get("Spring", {}).get("spring_type", None) if "Spring" in active else None
+    st_pos        = active.get("ST", {}).get("position", None) if "ST" in active else None
+    hh_hl_sos     = active.get("SOS", {}).get("hh_hl", None) if "SOS" in active else None
 
     expected = "bullish" if struct in BULLISH_STRUCTS else "bearish"
     correct  = (fwd_return > 0) if expected == "bullish" else (fwd_return < 0)
@@ -130,12 +135,15 @@ def analyze_one(symbol, end_ms, forward_ms):
         "fvg_bias":     fvg,
         "hl_bull":      hlb,
         "hl_bear":      hlbr,
-        "ar_choch":      ar_choch,
-        "ar_vol_slope":  ar_vol_slope,
-        "st_above_bc":   st_above_bc,
-        "spring_type":   spring_type,
-        "st_position":  st_pos,
-        "hh_hl_sos":    hh_hl_sos,
+        "ar_choch":       ar_choch,
+        "ar_vol_slope":   ar_vol_slope,
+        "ar_vol_anatomy": ar_vol_anatomy,
+        "ar_confirmed":   ar_confirmed,
+        "st_above_bc":    st_above_bc,
+        "st_below_sc":    st_below_sc,
+        "spring_type":    spring_type,
+        "st_position":    st_pos,
+        "hh_hl_sos":      hh_hl_sos,
     }
 
 
@@ -296,15 +304,21 @@ def main():
     for lbl, pred in choch_buckets:
         print_group(lbl, [r for r in records if pred(r)])
 
-    # ── AR volume slope ───────────────────────────────────────────────────────
-    print("\nBY AR VOLUME SLOPE (Ch.16 — declining vol = genuine AR anatomy):")
-    ar_vol_buckets = [
-        ("AR vol_slope < -0.05  (clearly declining = genuine AR)", lambda r: r["ar_vol_slope"] < -0.05),
-        ("AR vol_slope -0.05..+0.02 (neutral)",                    lambda r: -0.05 <= r["ar_vol_slope"] <= 0.02),
-        ("AR vol_slope > +0.02  (rising vol = forced/weak AR)",    lambda r: r["ar_vol_slope"] > 0.02),
+    # ── AR volume anatomy (first-half vs second-half) ────────────────────────
+    print("\nBY AR VOLUME ANATOMY (Ch.16 — first-half/second-half avg vol ratio):")
+    ar_anat_buckets = [
+        ("AR anatomy < 0.8  (rising vol = unhealthy AR)",    lambda r: r["ar_vol_anatomy"] < 0.80),
+        ("AR anatomy 0.8–1.5 (roughly flat)",                lambda r: 0.80 <= r["ar_vol_anatomy"] < 1.50),
+        ("AR anatomy > 1.5  (declining = healthy book anatomy)", lambda r: r["ar_vol_anatomy"] >= 1.50),
     ]
-    for lbl, pred in ar_vol_buckets:
+    for lbl, pred in ar_anat_buckets:
         print_group(lbl, [r for r in records if pred(r)])
+
+    # ── AR confirmed (Ch.16: AR ChoCH confirms SC/BC) ────────────────────────
+    print("\nBY AR-CONFIRMED (Ch.16 — SC/BC confirmed by AR ChoCH >= 0.3):")
+    for val, lbl in [(True, "SC/BC confirmed by AR ChoCH"), (False, "SC/BC NOT confirmed (AR too weak)")]:
+        grp = [r for r in records if r["ar_confirmed"] is val]
+        print_group(lbl, grp)
 
     # ── ST above BC (dist reaccumulation signal) ──────────────────────────────
     print("\nBY ST-ABOVE-BC (dist/redist only — Ch.16 reaccumulation signal):")
@@ -312,12 +326,18 @@ def main():
         grp = [r for r in records if r["structure"] in BEARISH_STRUCTS and r["st_above_bc"] is val]
         print_group(lbl, grp)
 
-    # ── AR combined quality (size + vol slope) ────────────────────────────────
-    print("\nAR COMBINED QUALITY (choch_strength > 0.8 AND vol_slope < -0.02):")
-    grp_good = [r for r in records if r["ar_choch"] > 0.8 and r["ar_vol_slope"] < -0.02]
-    grp_weak = [r for r in records if r["ar_choch"] <= 0.8 or  r["ar_vol_slope"] >= -0.02]
-    print_group("AR quality: GOOD (size ✓ + vol declining ✓)", grp_good)
-    print_group("AR quality: WEAK (size or vol fails)",         grp_weak)
+    # ── ST below SC (acc redistribution signal) ───────────────────────────────
+    print("\nBY ST-BELOW-SC (acc/reacc only — Ch.16 redistribution signal):")
+    for val, lbl in [(True, "ST below SC = Redistribution suspected"), (False, "ST holds above SC = Accumulation confirmed")]:
+        grp = [r for r in records if r["structure"] in BULLISH_STRUCTS and r["st_below_sc"] is val]
+        print_group(lbl, grp)
+
+    # ── AR combined quality (size + vol anatomy) ──────────────────────────────
+    print("\nAR COMBINED QUALITY (choch_strength > 0.8 AND vol_anatomy > 1.2):")
+    grp_good = [r for r in records if r["ar_choch"] > 0.8 and r["ar_vol_anatomy"] > 1.2]
+    grp_weak = [r for r in records if r["ar_choch"] <= 0.8 or  r["ar_vol_anatomy"] <= 1.2]
+    print_group("AR quality: GOOD (size ✓ + declining vol ✓)", grp_good)
+    print_group("AR quality: WEAK (size or vol anatomy fails)", grp_weak)
 
     # ── Spring type ───────────────────────────────────────────────────────────
     print("\nBY SPRING TYPE (acc structures only):")

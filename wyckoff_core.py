@@ -60,6 +60,7 @@ BC_SOFT_RSI_MIN  = 60     # przy require_rsi_climax=False: BC wymaga RSI >= 60 (
 SC_SOFT_RSI_MAX  = 50     # przy require_rsi_climax=False: SC wymaga RSI < 50 (poniżej środka)
                           # RSI >= 50 przy "SC" = normalny pullback w uptrend, nie klimaks wyczerpania
 SOW_MIN_BELOW_AR = 0.98   # SOW musi zamknąć się >= 2% poniżej AR low (zamiast 1%)
+AR_CHOCH_MIN_CONFIRM = 0.30  # minimalna siła ChoCH AR, żeby potwierdzić SC/BC jako prawdziwy
 
 # ── RSI ───────────────────────────────────────────────────────────────────────
 
@@ -287,6 +288,27 @@ def _ar_choch_strength(candles, climax_idx, ar_idx, is_acc=True):
     return (ar_pct / avg_swing) if avg_swing > 0 else 1.0
 
 
+def _ar_vol_anatomy(candles, climax_idx, ar_idx):
+    """
+    AR volume anatomy: first-half avg volume vs second-half avg volume ratio.
+    Book Ch.16: healthy AR starts with climax residual (high vol) → declines naturally.
+    > 1.0 = declining anatomy (healthy, interest fading).
+    < 1.0 = rising/flat anatomy (forced move, unnatural).
+    Better than linear slope — captures the start-high / end-low pattern directly.
+    """
+    n = ar_idx - climax_idx
+    if n < 4:
+        return 1.0
+    mid = climax_idx + n // 2
+    first_vols  = [candles[i]["volume"] for i in range(climax_idx + 1, mid + 1)]
+    second_vols = [candles[i]["volume"] for i in range(mid + 1, ar_idx + 1)]
+    if not first_vols or not second_vols:
+        return 1.0
+    avg_first  = sum(first_vols)  / len(first_vols)
+    avg_second = sum(second_vols) / len(second_vols)
+    return (avg_first / avg_second) if avg_second > 0 else 1.0
+
+
 # ── Linear regression slope ───────────────────────────────────────────────────
 
 def _slope_pct(closes):
@@ -491,7 +513,8 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
             break
 
         acc["SC"] = {"idx": sc_idx, "price": candles[sc_idx]["low"],
-                     "rsi": rsi_arr[sc_idx], "volume": candles[sc_idx]["volume"]}
+                     "rsi": rsi_arr[sc_idx], "volume": candles[sc_idx]["volume"],
+                     "ar_confirmed": False}  # default; updated below if AR is genuine ChoCH
 
         # AR: pierwsza pivot high PO SC, RSI wychodzi ze strefy bear
         ar_idx = None
@@ -509,14 +532,18 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
 
         if ar_idx is not None:
             _choch_acc = _ar_choch_strength(candles, sc_idx, ar_idx, is_acc=True)
+            # Book Ch.16: AR (ChoCH) is the primary confirmation of SC genuineness.
+            # SC is only "confirmed" if AR is strong enough to represent a real ChoCH.
+            acc["SC"]["ar_confirmed"] = (_choch_acc >= AR_CHOCH_MIN_CONFIRM)
             # Volume slope within the AR window (skip SC bar to avoid climax-volume bias).
-            # Book Ch.16: genuine AR has declining volume from start to end — interest fading.
-            # Positive slope = volume rising in AR = forced move, not natural demand exhaustion.
             _ar_vol_sl_acc = _range_vol_slope(candles, sc_idx + 1, ar_idx) if ar_idx > sc_idx + 2 else 0.0
+            # Volume anatomy: first-half vs second-half avg vol (better than linear slope).
+            _ar_vol_anat_acc = _ar_vol_anatomy(candles, sc_idx, ar_idx)
             acc["AR"] = {"idx": ar_idx, "price": candles[ar_idx]["high"],
                          "rsi": rsi_arr[ar_idx], "volume": candles[ar_idx]["volume"],
                          "choch_strength": _choch_acc,
-                         "vol_slope":      _ar_vol_sl_acc}
+                         "vol_slope":      _ar_vol_sl_acc,
+                         "vol_anatomy":    _ar_vol_anat_acc}
 
             # Wyznacz granice zakresu z SC i AR
             cr_low  = candles[sc_idx]["low"]
@@ -558,6 +585,19 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
                                            candles[st_idx]["volume"] <= (vsma[st_idx] or 1) * ST_VOL_RATIO,
                              "position": _st_pos,
                              "vol_vs_sc_ok": _st_vs_sc_ok}
+
+            # Book Ch.16: "Secondary Test ending below SC adds strength to redistribution scenario."
+            # Normal ST detection requires low >= SC * 0.995, so a genuine "below SC" test
+            # never qualifies as ST in our system — detect it with a separate scan of the
+            # first pivot low after AR. If it breaks SC by > 1%, bears are still in control.
+            _st_below_sc = False
+            for i in p_lows:
+                if i <= ar_idx:
+                    continue
+                if candles[i]["low"] < cr_low * 0.99:  # 1% break below SC = failed test
+                    _st_below_sc = True
+                break  # only first pivot low after AR matters
+            acc["_st_below_sc"] = _st_below_sc
 
             # Spring: pivot low PO ST który przebija rl ale zamyka powyżej
             # Niski wolumen, RSI crossover z bear na side
@@ -713,7 +753,8 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
             break
 
         dist["BC"] = {"idx": bc_idx, "price": candles[bc_idx]["high"],
-                      "rsi": rsi_arr[bc_idx], "volume": candles[bc_idx]["volume"]}
+                      "rsi": rsi_arr[bc_idx], "volume": candles[bc_idx]["volume"],
+                      "ar_confirmed": False}  # default; updated below if AR is genuine ChoCH
 
         # AR (dystrybucja): pierwsza pivot low PO BC z kluczowymi walidacjami:
         #  1. AR low musi być PONIŻEJ BC high (automatyczna reakcja w dół od BC)
@@ -739,12 +780,16 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
 
         if ar_d_idx is not None:
             _choch_dist = _ar_choch_strength(candles, bc_idx, ar_d_idx, is_acc=False)
+            # Book Ch.16: AR (ChoCH) confirms BC genuineness.
+            dist["BC"]["ar_confirmed"] = (_choch_dist >= AR_CHOCH_MIN_CONFIRM)
             # Volume slope within distribution AR window (skip BC bar to avoid climax-volume bias).
             _ar_vol_sl_dist = _range_vol_slope(candles, bc_idx + 1, ar_d_idx) if ar_d_idx > bc_idx + 2 else 0.0
+            _ar_vol_anat_dist = _ar_vol_anatomy(candles, bc_idx, ar_d_idx)
             dist["AR"] = {"idx": ar_d_idx, "price": candles[ar_d_idx]["low"],
                           "rsi": rsi_arr[ar_d_idx], "volume": candles[ar_d_idx]["volume"],
                           "choch_strength": _choch_dist,
-                          "vol_slope":      _ar_vol_sl_dist}
+                          "vol_slope":      _ar_vol_sl_dist,
+                          "vol_anatomy":    _ar_vol_anat_dist}
 
             cr_high_d = candles[bc_idx]["high"]
             cr_low_d  = candles[ar_d_idx]["low"]
@@ -1161,15 +1206,23 @@ def analyze_wyckoff(candles, verbose=False, require_rsi_climax=True):
         if _fvg_b < -0.002 and confidence == "HIGH":
             confidence = "MEDIUM"
 
-        # ChoCH (Ch.16): weak AR in accumulation → suspects redistribution, cap confidence.
-        # Book: "short-distance, intertwined AR with no volume peak → think redistribution."
-        # NOTE: strong AR boost (>1.5 → HIGH) was tested and showed 48.3% accuracy (below random)
-        # → only the downside cap is retained. Backtest: weak AR shows 50% (neutral → safe cap).
-        if _ar_choch_acc < 0.60:
+        # ChoCH (Ch.16): AR is the primary confirmation of SC genuineness.
+        # Book: "use AR ChoCH to identify the genuine Selling Climax."
+        # < 0.3 = AR not a genuine ChoCH → SC unconfirmed → force LOW regardless of phase.
+        # 0.3–0.6 = weak ChoCH → redistribution suspected → cap down 1 level.
+        # NOTE: strong AR boost (>1.5 → HIGH) was tested and showed 48.3% accuracy → removed.
+        if _ar_choch_acc < AR_CHOCH_MIN_CONFIRM:  # < 0.3: AR doesn't confirm SC
+            confidence = "LOW"
+        elif _ar_choch_acc < 0.60:
             if confidence == "HIGH":
                 confidence = "MEDIUM"
             elif confidence == "MEDIUM":
                 confidence = "LOW"
+
+        # Book Ch.16: "ST ending below SC adds strength to redistribution scenario."
+        # Bears still in control if ST can't hold above SC low.
+        if pts["acc"].get("_st_below_sc", False) and confidence in ("HIGH", "MEDIUM"):
+            confidence = "LOW"
 
     elif ctx == "distribution":
         _wvr  = pts["dist"].get("_wave_vol_ratio", 1.0)
@@ -1202,10 +1255,13 @@ def analyze_wyckoff(candles, verbose=False, require_rsi_climax=True):
         if _fvg_d > 0.002 and confidence in ("HIGH", "MEDIUM"):
             confidence = "LOW"
 
-        # ChoCH (Ch.16): weak AR (downward reaction after BC) in distribution → reaccumulation.
-        # Book: "weak/intertwined AR, no volume peak, ST above BC → reaccumulation suspected."
-        # Only cap; no boosts for distribution (backtest showed boosts unreliable in bull market).
-        if _ar_choch_dist < 0.60 and confidence in ("HIGH", "MEDIUM"):
+        # ChoCH (Ch.16): AR (downward reaction) is the primary confirmation of BC genuineness.
+        # Book: "use AR ChoCH to identify the genuine Buying Climax."
+        # < 0.3 = AR not a genuine ChoCH → BC unconfirmed → force LOW.
+        # 0.3–0.6 = weak ChoCH → reaccumulation suspected → cap down 1 level.
+        if _ar_choch_dist < AR_CHOCH_MIN_CONFIRM:  # < 0.3: AR doesn't confirm BC
+            confidence = "LOW"
+        elif _ar_choch_dist < 0.60 and confidence in ("HIGH", "MEDIUM"):
             if confidence == "HIGH":
                 confidence = "MEDIUM"
             else:

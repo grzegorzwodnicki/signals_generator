@@ -37,8 +37,7 @@ FORWARD_HOURS   = 72       # bars forward for outcome measurement
 STEP_HOURS      = 72       # step between windows (avoid overlap)
 LOOKBACK_DAYS   = 90       # how far back to go
 WORKERS         = 10
-REQUIRE_RSI     = False    # soft mode (require_rsi_climax=False)
-NO_RSI_MODE     = False    # remove ALL RSI gates (True = pure price+volume, False = soft RSI)
+REQUIRE_RSI     = False    # soft mode (NoRSI — empirically better)
 
 BULLISH_STRUCTS = {"Accumulation", "Reaccumulation"}
 BEARISH_STRUCTS = {"Distribution", "Redistribution"}
@@ -75,7 +74,7 @@ def analyze_one(symbol, end_ms, forward_ms):
     if not candles or len(candles) < 50:
         return None
 
-    r = wc.analyze_wyckoff(candles, verbose=False, require_rsi_climax=REQUIRE_RSI, no_rsi=NO_RSI_MODE)
+    r = wc.analyze_wyckoff(candles, verbose=False, require_rsi_climax=REQUIRE_RSI)
     struct = r["structure"]
 
     # Only record structures we can score directionally
@@ -179,8 +178,7 @@ def main():
 
     print(f"\n{'='*70}")
     print(f"  Wyckoff + SMC directional backtest")
-    rsi_mode = "NoRSI_ALL" if NO_RSI_MODE else ("NoRSI_Climax" if not REQUIRE_RSI else "RSI_strict")
-    print(f"  TF={TIMEFRAME}  forward={forward_hours}h  mode={rsi_mode}")
+    print(f"  TF={TIMEFRAME}  forward={forward_hours}h  NoRSI={not REQUIRE_RSI}")
     print(f"  symbols={args.symbols}  windows={args.windows}  step={STEP_HOURS}h")
     print(f"{'='*70}\n")
 

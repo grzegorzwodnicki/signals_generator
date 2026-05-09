@@ -13,7 +13,7 @@ import subprocess
 from datetime import datetime, timezone
 from wyckoff_core import analyze_wyckoff as _analyze_wyckoff_core
 
-REQUIRE_RSI_CLIMAX = True   # set False via prompt to disable RSI gate on SC/BC
+REQUIRE_RSI_CLIMAX = False  # False = better F30 (50.9% vs 47.2%); RSI gate hurts bearish detection in bull markets
 
 def analyze_wyckoff(candles):
     return _analyze_wyckoff_core(candles, verbose=True, require_rsi_climax=REQUIRE_RSI_CLIMAX)
@@ -1668,10 +1668,12 @@ def main():
         fetch_fn = get_candles
 
     global REQUIRE_RSI_CLIMAX
-    rsi_raw = input("Filtr RSI dla SC/BC? (Enter=tak / n=wyłącz RSI): ").strip().lower()
-    REQUIRE_RSI_CLIMAX = (rsi_raw != "n")
-    if not REQUIRE_RSI_CLIMAX:
-        print("  RSI wyłączone — detekcja SC/BC tylko na podstawie wolumenu i trendu.")
+    rsi_raw = input("Filtr RSI dla SC/BC? (Enter=nie / r=włącz RSI): ").strip().lower()
+    REQUIRE_RSI_CLIMAX = (rsi_raw == "r")
+    if REQUIRE_RSI_CLIMAX:
+        print("  RSI włączone — SC wymaga RSI<30, BC wymaga RSI>70.")
+    else:
+        print("  RSI wyłączone (domyślne) — detekcja SC/BC na wolumenie i trendzie.")
 
     choice = input("Dane teraźniejsze czy historyczne? (t=teraz / h=historyczne): ").strip().lower()
     is_backtest = False

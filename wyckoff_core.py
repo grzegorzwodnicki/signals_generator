@@ -20,8 +20,10 @@ RSI_SENS        = 20     # strefa neutralna: 50±RSI_SENS (domyślnie 30–70)
                          # bull = RSI > 50+sens, bear = RSI < 50-sens
 
 # Wolumen
-SC_VOL_MULT     = 1.5    # SC: wolumen >= X * sma(vol, 20)
-BC_VOL_MULT     = 1.5    # BC: j.w.
+SC_VOL_MULT      = 1.5   # SC (strict mode, require_rsi_climax=True): volume >= X * sma(vol, 20)
+BC_VOL_MULT      = 1.5   # BC (strict mode): j.w.
+SC_VOL_MULT_SOFT = 1.0   # SC (soft mode, require_rsi_climax=False): catches exhaustion-type SC
+BC_VOL_MULT_SOFT = 1.0   # BC (soft mode): catches exhaustion-type BC (Book Ch.15: SC/BC of Exhaustion)
 ST_VOL_RATIO    = 0.80   # ST: wolumen <= X * sma(vol, 20)  (niższy od średniej)
 
 # Zasięgi zakresu
@@ -53,6 +55,11 @@ VALIDITY_INVALIDATE_MULT = 0.5
 SC_BC_PRETREND_BARS = 20   # liczba świec PRZED SC/BC do oceny poprzedniego trendu
 # Spring/UTAD — minimalne przebicie granicy zakresu
 UTAD_SPRING_MIN_PCT = 0.003  # Spring/UTAD musi przekroczyć granicę o co najmniej 0.3%
+# Dystrybucja — minimalne wymagania jakości
+BC_SOFT_RSI_MIN  = 60     # przy require_rsi_climax=False: BC wymaga RSI >= 60 (miękki próg)
+SC_SOFT_RSI_MAX  = 50     # przy require_rsi_climax=False: SC wymaga RSI < 50 (poniżej środka)
+                          # RSI >= 50 przy "SC" = normalny pullback w uptrend, nie klimaks wyczerpania
+SOW_MIN_BELOW_AR = 0.98   # SOW musi zamknąć się >= 2% poniżej AR low (zamiast 1%)
 
 # ── RSI ───────────────────────────────────────────────────────────────────────
 
@@ -219,8 +226,13 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
     """
     Wykrywa sekwencyjnie punkty Wyckoffa na liście świec.
 
-    Akumulacja:  SC → AR → ST → [Spring] → SOS → LPS
-    Dystrybucja: BC → AR → ST → [UTAD]  → SOW → LPSY
+    Akumulacja:  [PS] → SC → AR → ST → [Spring] → SOS → LPS
+    Dystrybucja: [PSY] → BC → AR → ST → [UTAD]  → SOW → LPSY
+
+    Tryb SC/BC (require_rsi_climax):
+      True  — strict: RSI<30 dla SC / RSI>70 dla BC, volume >= 1.5x SMA (klasyczny klimaks)
+      False — soft:   brak RSI gate dla SC (RSI>=60 dla BC), volume >= 1.0x SMA
+              Wykrywa również SC/BC wyczerpaniowe (Exhaustion Climax wg. Villahermosa Ch.15)
 
     Parametry:
       candles   – lista dict {open, high, low, close, volume, time}
@@ -228,8 +240,8 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
       rsi_sens  – strefa neutralna RSI (domyślnie 20 → 30–70)
 
     Zwraca dict:
-      "acc"  → dict z punktami akumulacji (SC, AR, ST, Spring, SOS, LPS)
-      "dist" → dict z punktami dystrybucji (BC, AR, ST, UTAD, SOW, LPSY)
+      "acc"  → dict z punktami akumulacji (PS, SC, AR, ST, Spring, SOS, LPS)
+      "dist" → dict z punktami dystrybucji (PSY, BC, AR, ST, UTAD, SOW, LPSY)
       "rsi"  → lista wartości RSI
       "vol_sma" → lista vol SMA(20)
       "range_high", "range_low" → granice zakresu (lub None)
@@ -265,18 +277,27 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
     # ════════════════════════════════════════════════════════════════════════
     acc = {}
 
-    # SC: pivot low + RSI < rsi_low + wysoki wolumen
+    # SC: pivot low + RSI gate + wolumen
+    # Strict mode (require_rsi_climax=True):  RSI < 30 + volume >= 1.5x  (classic climax)
+    # Soft mode  (require_rsi_climax=False):  RSI < 50 + volume >= 1.0x  (exhaustion SC per book Ch.15)
+    _sc_vol_thresh = SC_VOL_MULT if require_rsi_climax else SC_VOL_MULT_SOFT
     sc_idx = None
     for i in p_lows:
         r = rsi_arr[i]
         v = vsma[i]
         if r is None or v is None:
             continue
-        # RSI w strefie bear przy pivot low (opcjonalne — wyłącz przy require_rsi_climax=False)
-        if require_rsi_climax and r >= rsi_low:
-            continue
-        # Wolumen >= SC_VOL_MULT * sma(vol,20)
-        if candles[i]["volume"] < v * SC_VOL_MULT:
+        # RSI gate:
+        #   strict: RSI < 30 (wyraźnie oversold)
+        #   soft:   RSI < 50 (przynajmniej poniżej środka — klimaks wyczerpania nie może być w bullish zone)
+        if require_rsi_climax:
+            if r >= rsi_low:        # strict: RSI >= 30 → odrzuć
+                continue
+        else:
+            if r >= SC_SOFT_RSI_MAX:  # soft: RSI >= 50 → odrzuć (nie SC, a normalny pullback)
+                continue
+        # Wolumen >= threshold * sma(vol,20)
+        if candles[i]["volume"] < v * _sc_vol_thresh:
             continue
         # Świeca spadkowa (close < open) lub długi dolny cień
         c = candles[i]
@@ -432,16 +453,23 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
     dist = {}
 
     # BC: pivot high + RSI > rsi_high + wysoki wolumen + świeca wzrostowa
+    # Strict mode (require_rsi_climax=True):  RSI > 70 + volume >= 1.5x  (classic climax)
+    # Soft mode  (require_rsi_climax=False): RSI >= 60 + volume >= 1.0x  (catches exhaustion BC)
+    _bc_vol_thresh = BC_VOL_MULT if require_rsi_climax else BC_VOL_MULT_SOFT
     bc_idx = None
     for i in p_highs:
         r = rsi_arr[i]
         v = vsma[i]
         if r is None or v is None:
             continue
-        # RSI w strefie bull przy pivot high (opcjonalne — wyłącz przy require_rsi_climax=False)
-        if require_rsi_climax and r <= rsi_high:
-            continue
-        if candles[i]["volume"] < v * BC_VOL_MULT:
+        # RSI gate: pełny (>70) lub miękki (>60) przy require_rsi_climax=False
+        if require_rsi_climax:
+            if r <= rsi_high:
+                continue
+        else:
+            if r < BC_SOFT_RSI_MIN:  # wyklucza oczywiste nie-kulminacje (RSI < 60)
+                continue
+        if candles[i]["volume"] < v * _bc_vol_thresh:
             continue
         c = candles[i]
         is_bullish_candle = c["close"] > c["open"] or (c["high"] - c["close"]) < (c["high"] - c["low"]) * 0.3
@@ -472,8 +500,11 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
         dist["BC"] = {"idx": bc_idx, "price": candles[bc_idx]["high"],
                       "rsi": rsi_arr[bc_idx], "volume": candles[bc_idx]["volume"]}
 
-        # AR (dystrybucja): pierwsza pivot low PO BC
+        # AR (dystrybucja): pierwsza pivot low PO BC z kluczowymi walidacjami:
+        #  1. AR low musi być PONIŻEJ BC high (automatyczna reakcja w dół od BC)
+        #  2. Między BC a AR nie może pojawić się wyższy szczyt — BC musi być THE top
         ar_d_idx = None
+        bc_high_price = candles[bc_idx]["high"]
         for i in p_lows:
             if i <= bc_idx:
                 continue
@@ -481,6 +512,12 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
             if r is None:
                 continue
             if r > rsi_high:
+                continue
+            # AR musi cofnąć się poniżej BC high (brak tego = trend kontynuował się w górę)
+            if candles[i]["low"] >= bc_high_price:
+                continue
+            # Między BC a AR nie może pojawić się wyższy szczyt (BC nie był prawdziwą kulminacją)
+            if any(candles[j]["high"] > bc_high_price for j in range(bc_idx + 1, i)):
                 continue
             ar_d_idx = i
             break
@@ -542,7 +579,7 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
                     if r is None:
                         continue
                     c = candles[i]
-                    below_cr = c["close"] < cr_low_d * 0.99
+                    below_cr = c["close"] < cr_low_d * SOW_MIN_BELOW_AR
                     bear_rsi  = r < 45
                     if below_cr and bear_rsi:
                         dist["SOW"] = {"idx": i, "price": c["low"],

@@ -21,7 +21,7 @@ OUTPUT_DIR = "output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 BACKTEST_TIME_MS   = None
-REQUIRE_RSI_CLIMAX = True   # set False via prompt to disable RSI gate on SC/BC
+REQUIRE_RSI_CLIMAX = False  # False = better F30 (50.9% vs 47.2%); RSI gate hurts bearish detection in bull markets
 
 TIMEFRAMES = ["5m", "15m", "30m", "1H", "4H", "1D", "1W"]
 TF_LABEL   = {"5m": "5M", "15m": "15M", "30m": "30M", "1H": "1H", "4H": "4H", "1D": "1D", "1W": "1W"}
@@ -770,8 +770,9 @@ def main():
     print("\nRynek:")
     print("  c = Krypto (Bybit Top 400)")
     print("  b = Krypto (Binance Top 400)")
+    print("  f = Krypto FTMO (crypto_ftmo.txt)")
     print("  s = Stocki (lista z pliku)")
-    market = input("Wybierz (c/b/s): ").strip().lower()
+    market = input("Wybierz (c/b/f/s): ").strip().lower()
 
     if market == "s":
         print("\nPlik symboli:")
@@ -783,6 +784,11 @@ def main():
         stock_file     = os.path.join(_root, stock_filename)
         fetch_fn       = get_candles_stock
         max_scan_workers = 5
+    elif market == "f":
+        _root      = os.path.dirname(os.path.abspath(__file__))
+        stock_file = os.path.join(_root, "crypto_ftmo.txt")
+        fetch_fn   = get_candles
+        max_scan_workers = 20
     elif market == "b":
         stock_file       = None
         fetch_fn         = get_candles_binance
@@ -818,10 +824,12 @@ def main():
 
     # ── RSI toggle ──
     global REQUIRE_RSI_CLIMAX
-    rsi_raw = input("\nFiltr RSI dla SC/BC? (Enter=tak / n=wyłącz RSI): ").strip().lower()
-    REQUIRE_RSI_CLIMAX = (rsi_raw != "n")
-    if not REQUIRE_RSI_CLIMAX:
-        print("  RSI wyłączone — detekcja SC/BC tylko na podstawie wolumenu i trendu.")
+    rsi_raw = input("\nFiltr RSI dla SC/BC? (Enter=nie / r=włącz RSI): ").strip().lower()
+    REQUIRE_RSI_CLIMAX = (rsi_raw == "r")
+    if REQUIRE_RSI_CLIMAX:
+        print("  RSI włączone — SC wymaga RSI<30, BC wymaga RSI>70.")
+    else:
+        print("  RSI wyłączone (domyślne) — detekcja SC/BC na wolumenie i trendzie.")
 
     # ── Time mode ──
     choice      = input("\nDane (t=teraz / h=historyczne): ").strip().lower()
@@ -844,7 +852,14 @@ def main():
     report_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # ── Fetch symbols ──
-    if market == "s":
+    if market == "f":
+        print(f"\nWczytuję symbole z crypto_ftmo.txt...")
+        symbols = get_stock_symbols(stock_file)
+        if not symbols:
+            print("Brak symboli w pliku. Sprawdź ścieżkę.")
+            return
+        print(f"  {len(symbols)} symboli.")
+    elif market == "s":
         print(f"\nWczytuję symbole z {stock_filename}...")
         symbols = get_stock_symbols(stock_file)
         if not symbols:
@@ -941,6 +956,8 @@ def main():
     cond_safe    = "_".join(f'{c["tf"]}ph{"".join(c["phases"])}' for c in conditions)
     if market == "s":
         market_label = "stocks_" + os.path.splitext(stock_filename)[0]
+    elif market == "f":
+        market_label = "crypto_ftmo"
     elif market == "b":
         market_label = "crypto_binance"
     else:

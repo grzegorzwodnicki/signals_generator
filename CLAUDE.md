@@ -38,13 +38,15 @@ Shared module imported by **both** `analyze_instrument.py` and `wyckoff_phase_sc
 
 ```python
 from wyckoff_core import analyze_wyckoff
-result = analyze_wyckoff(candles, verbose=False)
+result = analyze_wyckoff(candles, verbose=False, require_rsi_climax=False)
 # returns: structure, phase, events, confidence, range_high, range_low,
 #          full_trend, recent_trend, ranging, _points
 ```
 
 - `verbose=False` → short scanner labels (`"SOS"`, `"Spring"`, …)
 - `verbose=True` → descriptive labels (`"SOS — break above range high"`, …) — used by `analyze_instrument.py`
+- `require_rsi_climax=False` (default in scanners) → soft mode: no RSI gate on SC/BC, volume ≥ 1.0× SMA; catches exhaustion-type climaxes per book Ch.15
+- `require_rsi_climax=True` → strict mode: RSI < 30 for SC / RSI > 70 for BC, volume ≥ 1.5× SMA; classic climax only
 - `_points` → raw detection dict with `acc`, `dist`, `context`, `rsi`, `vol_sma`, `range_high`, `range_low` — used by report renderers to show per-point RSI/Vol/time badges
 
 **Detection algorithm (v2 — pivot + RSI + volume):**
@@ -66,7 +68,11 @@ Sequential detection: `SC → AR → ST → Spring → SOS → LPS` (accumulatio
 ```python
 def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require_rsi_climax=True):
 ```
-`require_rsi_climax=False` bypasses RSI gates on SC/BC (useful for testing volume-only detection).
+`require_rsi_climax=False` — soft mode: SC requires RSI < 50 (`SC_SOFT_RSI_MAX`) + volume ≥ 1.0× SMA; BC requires RSI ≥ 60 (`BC_SOFT_RSI_MIN`) + volume ≥ 1.0× SMA. Catches exhaustion-type SC/BC (book Ch.15) while still requiring bearish/bullish RSI context. **Default for scanner/analyzer scripts is `False`** — strict RSI >70 hurts Distribution in bull markets; NoRSI wins 75% of disagreements. Scripts expose an interactive prompt: `Enter=no RSI / r=enable RSI`.
+
+**Distribution AR validation (added):** AR for distribution must (1) have `AR low < BC high` (reaction must pull back below BC), and (2) no candle between BC and AR may exceed BC high (BC must be THE peak, not a mid-trend pause). Both constraints together eliminate ~17% of false Distribution signals.
+
+**Fundamental Distribution limitation:** ~32% of false Distribution/Redistribution signals are structurally indistinguishable from Reaccumulation (Phase B looks identical in both). Only Phase D (SOW confirmed, ≥2% below AR) gives reliable bearish signals. Trust Phase D distributions; treat Phase A/B as ambiguous.
 
 **Context selection (Błąd 1 fix):** when both `acc` (SC found) and `dist` (BC found) are detected simultaneously, the winner is chosen by **sequence score** (how many points confirmed), not by SC.idx vs BC.idx. Tiebreak: whichever direction's last detected point is later.
 
@@ -94,13 +100,19 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
 | `PIVOT_LEN` | 5 | bars on each side for pivot high/low detection |
 | `RSI_LEN` | 14 | RSI period |
 | `RSI_SENS` | 20 | neutral band: 50±20 (bull > 70, bear < 30) |
-| `SC_VOL_MULT` | 1.5 | SC/BC: volume ≥ 1.5× SMA(20) |
+| `SC_VOL_MULT` | 1.5 | SC: volume ≥ 1.5× SMA(20) — strict mode (`require_rsi_climax=True`) |
+| `SC_VOL_MULT_SOFT` | 1.0 | SC: volume ≥ 1.0× SMA(20) — soft mode (`require_rsi_climax=False`); catches exhaustion-type SC (book Ch.15) |
+| `BC_VOL_MULT` | 1.5 | BC: volume ≥ 1.5× SMA(20) — strict mode |
+| `BC_VOL_MULT_SOFT` | 1.0 | BC: volume ≥ 1.0× SMA(20) — soft mode; catches exhaustion-type BC |
 | `ST_VOL_RATIO` | 0.80 | ST: volume ≤ 0.80× SMA(20) preferred |
 | `RANGE_SPAN_MAX` | 0.25 | `(high−low)/avg` < this for a range window |
 | `RANGE_SLOPE_MAX` | 0.010 | `\|slope\| / avg_price` per bar |
 | `_MIN_CANDLES` | 30 | minimum candles; fewer → returns `Insufficient` |
 | `SC_BC_PRETREND_BARS` | 20 | bars before SC/BC to check pre-climax trend; SC rejected if pre-trend is bullish, BC rejected if bearish |
 | `UTAD_SPRING_MIN_PCT` | 0.003 | Spring/UTAD must penetrate range boundary by ≥ 0.3% (prevents 1-tick false breaks) |
+| `BC_SOFT_RSI_MIN` | 60 | minimum RSI for BC when `require_rsi_climax=False`; filters non-climax peaks with RSI<60 (49% of false Distribution signals had RSI<65) |
+| `SC_SOFT_RSI_MAX` | 50 | maximum RSI for SC when `require_rsi_climax=False`; RSI ≥ 50 = normal pullback in uptrend, not an exhaustion climax; eliminates false-positive SC in bullish context |
+| `SOW_MIN_BELOW_AR` | 0.98 | SOW must close ≥ 2% below AR low (was 1%); prevents weak dips from triggering SOW in bull-market pullbacks |
 
 **Confidence:** graduated caps via `_CONF_CAPS` — `n < 45` → LOW, `n < 70` → MEDIUM, `n ≥ 70` → unrestricted.
 

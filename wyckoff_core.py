@@ -123,6 +123,70 @@ def _vol_sma(candles, period=20):
             result.append(sum(vols[i - period + 1: i + 1]) / period)
     return result
 
+# ── Volume analysis helpers ───────────────────────────────────────────────────
+
+def _range_vol_slope(candles, start_idx, end_idx):
+    """
+    Normalized linear regression slope of volume across a range window.
+    Negative = declining volume (accumulation/reaccumulation signature, Villahermosa Ch.9).
+    Positive = flat/rising volume (distribution signature — high constant volume throughout range).
+    Returns slope per bar, normalized by mean volume.
+    """
+    end_idx = min(end_idx, len(candles) - 1)
+    if end_idx <= start_idx:
+        return 0.0
+    vols = [candles[i]["volume"] for i in range(start_idx, end_idx + 1)]
+    n = len(vols)
+    if n < 5:
+        return 0.0
+    mean_v = sum(vols) / n
+    if mean_v == 0:
+        return 0.0
+    mean_i = (n - 1) / 2.0
+    denom = sum((i - mean_i) ** 2 for i in range(n))
+    if denom == 0:
+        return 0.0
+    numer = sum((i - mean_i) * (vols[i] - mean_v) for i in range(n))
+    return (numer / denom) / mean_v
+
+
+def _wave_vol_ratio(candles, pivots):
+    """
+    Weis wave analysis: ratio of avg cumulative volume on upward legs vs downward legs.
+    pivots: list of (idx, direction) where direction is 'H' or 'L', sorted by idx.
+    Ratio > 1.0 = up-legs carry more volume (accumulation / bullish bias).
+    Ratio < 1.0 = down-legs carry more volume (distribution / bearish bias).
+    Returns 1.0 when insufficient data.
+    """
+    up_vols, down_vols = [], []
+    for k in range(len(pivots) - 1):
+        a_idx, a_dir = pivots[k]
+        b_idx, b_dir = pivots[k + 1]
+        if a_idx >= b_idx:
+            continue
+        wave_vol = sum(candles[j]["volume"] for j in range(a_idx, min(b_idx + 1, len(candles))))
+        if a_dir == 'L' and b_dir == 'H':
+            up_vols.append(wave_vol)
+        elif a_dir == 'H' and b_dir == 'L':
+            down_vols.append(wave_vol)
+    if not up_vols or not down_vols:
+        return 1.0
+    return (sum(up_vols) / len(up_vols)) / (sum(down_vols) / len(down_vols))
+
+
+def _check_hh_hl(candles, idx, lookback=10):
+    """
+    Check if bars before idx show a rising low pattern (at least half of consecutive
+    lows are higher than the previous). Confirms structure building before SOS.
+    """
+    start = max(0, idx - lookback)
+    lows = [candles[j]["low"] for j in range(start, idx)]
+    if len(lows) < 3:
+        return False
+    rising = sum(1 for k in range(1, len(lows)) if lows[k] > lows[k - 1])
+    return rising >= len(lows) // 2
+
+
 # ── Linear regression slope ───────────────────────────────────────────────────
 
 def _slope_pct(closes):
@@ -375,10 +439,18 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
                     break
 
             if st_idx is not None:
+                # ST position within range: upper half = bullish strength, lower = weakness
+                _range_mid = (cr_high + cr_low) / 2
+                _st_pos = "upper" if candles[st_idx]["low"] >= _range_mid else "lower"
+                # ST volume vs SC volume (book: ST should be lower volume than SC)
+                _sc_vol = candles[sc_idx]["volume"]
+                _st_vs_sc_ok = candles[st_idx]["volume"] < _sc_vol * 0.90
                 acc["ST"] = {"idx": st_idx, "price": candles[st_idx]["low"],
                              "rsi": rsi_arr[st_idx], "volume": candles[st_idx]["volume"],
                              "low_volume": vsma[st_idx] is not None and
-                                           candles[st_idx]["volume"] <= (vsma[st_idx] or 1) * ST_VOL_RATIO}
+                                           candles[st_idx]["volume"] <= (vsma[st_idx] or 1) * ST_VOL_RATIO,
+                             "position": _st_pos,
+                             "vol_vs_sc_ok": _st_vs_sc_ok}
 
             # Spring: pivot low PO ST który przebija rl ale zamyka powyżej
             # Niski wolumen, RSI crossover z bear na side
@@ -395,11 +467,22 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
                     # Fałszywe wybicie: low musi przekroczyć cr_low o min. UTAD_SPRING_MIN_PCT
                     if c["low"] < cr_low * (1 - UTAD_SPRING_MIN_PCT) and c["close"] > cr_low:
                         low_vol = v is None or c["volume"] <= v * 0.9
+                        # Spring Type (Villahermosa): 1=high-vol shakeout (needs test),
+                        # 2=moderate, 3=exhaustion/low-vol (strongest — direct entry signal)
+                        _sv = v or 1
+                        _penetration = (cr_low - c["low"]) / cr_low if cr_low > 0 else 0
+                        if _penetration > 0.01 and c["volume"] > _sv * 1.3:
+                            spring_type = 1
+                        elif c["volume"] > _sv * 0.8:
+                            spring_type = 2
+                        else:
+                            spring_type = 3
                         acc["Spring"] = {"idx": i, "price": c["low"],
                                          "close": c["close"],
                                          "rsi": r,
                                          "volume": c["volume"],
-                                         "low_volume": low_vol}
+                                         "low_volume": low_vol,
+                                         "spring_type": spring_type}
                         break
 
             # SOS: pivot high PO (Spring lub ST) + RSI wchodzi w bull zone + wysoki wolumen
@@ -422,7 +505,8 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
                                       "close": c["close"],
                                       "rsi": r,
                                       "volume": c["volume"],
-                                      "high_volume": hi_vol}
+                                      "high_volume": hi_vol,
+                                      "hh_hl": _check_hh_hl(candles, i)}
                         break
 
             # LPS: pivot low PO SOS + cena powyżej CR (stary resistance = nowe wsparcie)
@@ -446,6 +530,24 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
                                       "volume": c["volume"],
                                       "low_volume": low_vol}
                         break
+
+        # ── Volume analysis across accumulation range ─────────────────────────
+        if "SC" in acc:
+            _sc_i = acc["SC"]["idx"]
+            _latest_i = max((v["idx"] for v in acc.values() if isinstance(v, dict) and "idx" in v), default=_sc_i)
+            # Measure from AR onwards (Phase B start) to capture intra-range vol trend.
+            # SC itself has climactic high vol — including it biases slope downward always.
+            _slope_start = acc.get("AR", {}).get("idx") or _sc_i
+            acc["_range_vol_slope"] = _range_vol_slope(candles, _slope_start, _latest_i)
+
+            # Weis wave: L for lows (SC, ST, Spring, LPS), H for highs (AR, SOS)
+            _pivots = []
+            for _key, _dir in [("SC", 'L'), ("AR", 'H'), ("ST", 'L'),
+                                ("Spring", 'L'), ("SOS", 'H'), ("LPS", 'L')]:
+                if _key in acc:
+                    _pivots.append((acc[_key]["idx"], _dir))
+            _pivots.sort()
+            acc["_wave_vol_ratio"] = _wave_vol_ratio(candles, _pivots) if len(_pivots) >= 2 else 1.0
 
     # ════════════════════════════════════════════════════════════════════════
     # DYSTRYBUCJA: BC → AR → ST → UTAD → SOW → LPSY
@@ -591,6 +693,7 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
             # LPSY: pivot high PO SOW + cena poniżej CR high + niski wolumen + RSI < 50
             if "SOW" in dist:
                 sow_i = dist["SOW"]["idx"]
+                _utad_vol = dist.get("UTAD", {}).get("volume", None)
                 for i in p_highs:
                     if i <= sow_i:
                         continue
@@ -603,11 +706,32 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
                     rsi_weak = r <= 55
                     low_vol  = v is None or c["volume"] <= v * ST_VOL_RATIO
                     if below_resistance and rsi_weak:
+                        # Book: LPSY/test after UTAD should be weaker (lower vol) than UTAD
+                        _utad_test_weak = (_utad_vol is None or c["volume"] < _utad_vol * 0.90)
                         dist["LPSY"] = {"idx": i, "price": c["high"],
                                         "rsi": r,
                                         "volume": c["volume"],
-                                        "low_volume": low_vol}
+                                        "low_volume": low_vol,
+                                        "utad_test_weak": _utad_test_weak}
                         break
+
+        # ── Volume analysis across distribution range ─────────────────────────
+        if "BC" in dist:
+            _bc_i = dist["BC"]["idx"]
+            _latest_i = max((v["idx"] for v in dist.values() if isinstance(v, dict) and "idx" in v), default=_bc_i)
+            # Measure from AR onwards — BC climax vol is the highest point, including it
+            # makes slope always negative. Phase B intra-range vol is the real diagnostic.
+            _slope_start_d = dist.get("AR", {}).get("idx") or _bc_i
+            dist["_range_vol_slope"] = _range_vol_slope(candles, _slope_start_d, _latest_i)
+
+            # Weis wave: H for highs (BC, ST, UTAD, LPSY), L for lows (AR, SOW)
+            _pivots = []
+            for _key, _dir in [("BC", 'H'), ("AR", 'L'), ("ST", 'H'),
+                                ("UTAD", 'H'), ("SOW", 'L'), ("LPSY", 'H')]:
+                if _key in dist:
+                    _pivots.append((dist[_key]["idx"], _dir))
+            _pivots.sort()
+            dist["_wave_vol_ratio"] = _wave_vol_ratio(candles, _pivots) if len(_pivots) >= 2 else 1.0
 
     # ── Walidacja wzorca — czy pattern jest jeszcze aktualny? ───────────────────
     # Sprawdza aktualną cenę względem wykrytego range'u.
@@ -661,8 +785,9 @@ def find_wyckoff_points(candles, pivot_len=PIVOT_LEN, rsi_sens=RSI_SENS, require
             context = "accumulation" if acc_score > dist_score else "distribution"
         else:
             # Remis — wygrywa ta której OSTATNI wykryty punkt jest późniejszy
-            acc_last  = max((v["idx"] for v in acc.values()),  default=0)
-            dist_last = max((v["idx"] for v in dist.values()), default=0)
+            # (skip non-dict entries like _range_vol_slope / _wave_vol_ratio)
+            acc_last  = max((v["idx"] for v in acc.values()  if isinstance(v, dict) and "idx" in v), default=0)
+            dist_last = max((v["idx"] for v in dist.values() if isinstance(v, dict) and "idx" in v), default=0)
             context = "accumulation" if acc_last >= dist_last else "distribution"
     elif has_acc:
         context = "accumulation"
@@ -748,6 +873,19 @@ def analyze_wyckoff(candles, verbose=False, require_rsi_climax=True):
         # Multi-window trend PRZED SC (pomijamy ostatnie 5 świec żeby nie wliczać samego SC)
         _pre_sc = candles[:_sc_idx] if _sc_idx > 20 else candles
         struct_trend = _multi_trend(_pre_sc, skip_last=5)
+
+        # Override neutral → bearish when SC price is significantly below pre-SC median
+        # (book: Accumulation follows a bearish trend; if multi-window is ambiguous but SC
+        #  is clearly depressed vs prior action, the market was in a downtrend before SC)
+        if struct_trend == "neutral" and _sc_idx >= 10:
+            _pre_window = candles[max(0, _sc_idx - 60):_sc_idx]
+            if len(_pre_window) >= 10:
+                _pre_closes = sorted(c["close"] for c in _pre_window)
+                _pre_median = _pre_closes[len(_pre_closes) // 2]
+                _sc_close   = candles[_sc_idx]["close"]
+                if _pre_median > 0 and _sc_close < _pre_median * 0.85:
+                    struct_trend = "bearish"  # SC is 15%+ below median → Accumulation
+
     elif ctx == "distribution" and _bc_idx is not None:
         # Multi-window trend PRZED BC
         _pre_bc = candles[:_bc_idx] if _bc_idx > 20 else candles
@@ -860,6 +998,56 @@ def analyze_wyckoff(candles, verbose=False, require_rsi_climax=True):
             structure, phase, confidence = "Trend (Bearish)", "E", "MEDIUM"
         else:
             structure, phase, confidence = "UNCLEAR", "Unclear", "LOW"
+
+    # ── Volume-based confidence adjustments ──────────────────────────────────
+    # Applied after phase/structure logic, before the candle-count cap.
+
+    if ctx == "accumulation":
+        _wvr = pts["acc"].get("_wave_vol_ratio", 1.0)
+        _rvs = pts["acc"].get("_range_vol_slope", 0.0)
+        _spring = pts["acc"].get("Spring", {})
+        _spring_type = _spring.get("spring_type", 2) if _spring else 2
+
+        # Spring Type 3 (exhaustion, low vol) is the strongest signal — boost confidence
+        if "Spring" in pts["acc"] and _spring_type == 3 and confidence == "LOW":
+            confidence = "MEDIUM"
+
+        # Spring Type 1 (high-vol shakeout) requires a subsequent test — cap at MEDIUM
+        if "Spring" in pts["acc"] and _spring_type == 1 and confidence == "HIGH" and "LPS" not in pts["acc"]:
+            confidence = "MEDIUM"
+
+        # Wave vol ratio < 0.8 in "accumulation" context = down-legs dominate
+        # Suspicious — may actually be distribution. Cap confidence.
+        if _wvr < 0.80 and confidence == "HIGH":
+            confidence = "MEDIUM"
+
+    elif ctx == "distribution":
+        _wvr = pts["dist"].get("_wave_vol_ratio", 1.0)
+        _rvs = pts["dist"].get("_range_vol_slope", 0.0)
+
+        # Signal 1 (Villahermosa Ch.9): if up-legs dominate volume = Reaccumulation, not Distribution.
+        # WVR > 1.5 alone is sufficient — price is absorbing supply, not distributing.
+        # WVR > 1.2 + declining slope = declining vol + bullish waves = Reacc signature.
+        if _wvr > 1.50:
+            if confidence == "HIGH":
+                confidence = "MEDIUM"
+            elif confidence == "MEDIUM":
+                confidence = "LOW"
+        elif _wvr > 1.20 and _rvs < -0.010:
+            if confidence == "HIGH":
+                confidence = "MEDIUM"
+            elif confidence == "MEDIUM":
+                confidence = "LOW"
+
+        # Signal 2: strongly bearish wave vol (down-legs carry 25%+ more vol) confirms
+        # genuine distribution — boost Phase D structures from LOW to MEDIUM.
+        if _wvr < 0.80 and "SOW" in pts["dist"] and confidence == "LOW":
+            confidence = "MEDIUM"
+
+        # Signal 3: LPSY weaker than UTAD confirms genuine distribution Phase D
+        if "LPSY" in pts["dist"] and "UTAD" in pts["dist"]:
+            if pts["dist"]["LPSY"].get("utad_test_weak", False) and confidence == "MEDIUM":
+                confidence = "HIGH"
 
     # Zakres
     ranging = False

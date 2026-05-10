@@ -44,8 +44,8 @@ TF_BINANCE = {"5m": "5m", "15m": "15m", "30m": "30m", "1H": "1h",
 ATR_ZONE_MULT  = 0.5    # default: price within N×ATR of nearest zone boundary
 ATR_PERIOD     = 14     # ATR period for zone proximity check
 OB_LOOKBACK    = 150    # candles to search for OB
+OB_PIVOT_LEN   = 5      # volume pivot length (bars on each side) — matches LuxAlgo default
 FVG_LOOKBACK   = 120    # candles to search for FVG
-OB_MIN_DISP    = 0.001  # minimum displacement (0.1%) for OB confirmation candle
 
 _SEMAPHORE         = threading.Semaphore(20)
 _POLYGON_SEMAPHORE = threading.Semaphore(5)
@@ -277,31 +277,65 @@ def detect_fvg(candles, direction, lookback=FVG_LOOKBACK):
     return fvg
 
 
-def detect_ob(candles, direction, lookback=OB_LOOKBACK):
-    """Return the most recent valid Order Block in the given direction, or None."""
-    src     = candles[-lookback:] if len(candles) > lookback else candles
-    ob      = None
-    ob_time = None
-    for i in range(1, len(src) - 2):
-        c, nx = src[i], src[i+1]
-        if c["open"] == 0:
+def detect_ob(candles, direction, lookback=OB_LOOKBACK, pivot_len=OB_PIVOT_LEN):
+    """
+    LuxAlgo-style Order Block detection (volume pivot + market structure).
+
+    Bullish OB (LONG):
+      - Volume pivot high at candle i (higher vol than pivot_len bars each side)
+      - Market moved UP since: min low of all subsequent bars > OB candle's low
+        (simultaneously confirms bullish structure AND that OB is not yet mitigated)
+      - Zone = candle.low → (candle.high + candle.low) / 2  [lower half]
+
+    Bearish OB (SHORT):
+      - Volume pivot high at candle i
+      - Market moved DOWN since: max high of all subsequent bars < OB candle's high
+      - Zone = (candle.high + candle.low) / 2 → candle.high  [upper half]
+
+    Returns the most recent valid (unmitigated) OB, or None.
+    """
+    src = candles[-lookback:] if len(candles) > lookback else candles
+    n   = len(src)
+    if n < pivot_len * 2 + 2:
+        return None
+
+    # Scan newest-to-oldest pivot candidates; return first valid OB found
+    for i in range(n - pivot_len - 1, pivot_len - 1, -1):
+        vol_i = src[i]["volume"]
+        if vol_i == 0:
             continue
+
+        # Volume pivot high: strictly greater than pivot_len bars on each side
+        if not all(vol_i > src[i - k]["volume"] for k in range(1, pivot_len + 1)):
+            continue
+        if not all(vol_i > src[i + k]["volume"] for k in range(1, pivot_len + 1)):
+            continue
+
+        ob_c  = src[i]
+        hl2   = (ob_c["high"] + ob_c["low"]) / 2
+        after = src[i + 1:]
+
         if direction == "LONG":
-            if (c["close"] < c["open"] and
-                    nx["close"] > c["open"] and
-                    (nx["close"] - nx["open"]) / max(c["open"], 1e-9) > OB_MIN_DISP):
-                ob      = {"ob_low": c["low"], "ob_high": c["high"]}
-                ob_time = c["time"]
-        else:
-            if (c["close"] > c["open"] and
-                    nx["close"] < c["open"] and
-                    (c["open"] - nx["close"]) / max(c["open"], 1e-9) > OB_MIN_DISP):
-                ob      = {"ob_low": c["low"], "ob_high": c["high"]}
-                ob_time = c["time"]
-    if ob:
-        ob["mid"]  = (ob["ob_low"] + ob["ob_high"]) / 2
-        ob["time"] = ob_time
-    return ob
+            # Bullish OB: price must have moved entirely above OB's low (structure + no mitigation)
+            if min(c["low"] for c in after) <= ob_c["low"]:
+                continue
+            ob_low, ob_high = ob_c["low"], hl2
+
+        else:  # SHORT
+            # Bearish OB: price must have moved entirely below OB's high (structure + no mitigation)
+            if max(c["high"] for c in after) >= ob_c["high"]:
+                continue
+            ob_low, ob_high = hl2, ob_c["high"]
+
+        return {
+            "ob_low":  ob_low,
+            "ob_high": ob_high,
+            "mid":     (ob_low + ob_high) / 2,
+            "time":    ob_c["time"],
+            "vol":     vol_i,
+        }
+
+    return None
 
 
 def _calc_atr(candles, period=ATR_PERIOD):
@@ -928,10 +962,13 @@ _TF_ALIASES = {
 }
 
 
-def _ask_tf(prompt):
+def _ask_tf(prompt, default=None):
+    hint = f" (Enter = {default})" if default else ""
     print("  Timeframes: 5m · 15m · 30m · 1H · 4H · 1D · 1W")
-    raw = input(prompt).strip()
-    tf  = _TF_ALIASES.get(raw, raw)
+    raw = input(prompt + hint + ": ").strip()
+    if not raw and default:
+        return default
+    tf = _TF_ALIASES.get(raw, raw)
     if tf not in TIMEFRAMES:
         print(f"  Nieznany TF '{raw}'.")
         return None
@@ -981,7 +1018,7 @@ def main():
 
     # ── Zone TF ───────────────────────────────────────────────
     print("\n--- Strefa wejścia ---")
-    ob_tf = _ask_tf("TF dla strefy OB / FVG (np. 1H, 4H): ")
+    ob_tf = _ask_tf("TF dla strefy OB / FVG", default="1H")
     if ob_tf is None:
         return
 
@@ -1004,7 +1041,7 @@ def main():
 
     # ── Wyckoff TF ────────────────────────────────────────────
     print("\n--- Potwierdzenie Wyckoff ---")
-    wy_tf = _ask_tf("TF dla Wyckoff (np. 15m, 30m, 1H): ")
+    wy_tf = _ask_tf("TF dla Wyckoff", default="15m")
     if wy_tf is None:
         return
 
@@ -1029,9 +1066,9 @@ def main():
     print(f"  Kierunek: {dir_filter}")
 
     # ── RSI toggle ────────────────────────────────────────────
-    rsi_raw            = input("\nFiltr RSI dla SC/BC? (Enter=nie / r=włącz): ").strip().lower()
-    REQUIRE_RSI_CLIMAX = (rsi_raw == "r")
-    print("  RSI włączone." if REQUIRE_RSI_CLIMAX else "  RSI wyłączone (domyślne).")
+    rsi_raw            = input("\nFiltr RSI dla SC/BC? (Enter=włącz / n=wyłącz): ").strip().lower()
+    REQUIRE_RSI_CLIMAX = (rsi_raw != "n")
+    print("  RSI włączone." if REQUIRE_RSI_CLIMAX else "  RSI wyłączone.")
 
     # ── Time mode ─────────────────────────────────────────────
     choice      = input("\nDane (t=teraz / h=historyczne): ").strip().lower()
